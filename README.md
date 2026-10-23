@@ -17,6 +17,7 @@ an outage fail loudly instead.
 ./provider-picker.ts z-ai/glm-5.3 -p baseten # only BaseTen's endpoints (or a bare word: … baseten)
 ./provider-picker.ts z-ai/glm-5.3 --verify   # prove the pick serves for this account
 ./provider-picker.ts z-ai/glm-5.3 --json     # machine-readable output
+./provider-picker.ts z-ai/glm-5.3 --pick     # just the chosen endpoint tag: wafer/us
 ```
 
 ```text
@@ -57,6 +58,17 @@ A `model:provider` suffix such as `z-ai/glm-5.3:Together` does **not** pin
 anything. OpenRouter ignores it and routes as usual. The `pin` line
 (`model:tag`) is only a compact identifier for your own config. Whatever reads
 it has to turn it into the `provider` object above.
+
+For scripts, `--pick` prints only the chosen tag, one line per model in
+argument order. It combines with every filter and with `--verify`:
+
+```sh
+tag=$(./provider-picker.ts z-ai/glm-5.3 -x CN --verify --pick) || exit 1
+```
+
+A model with no pick writes its reason to stderr, prints nothing to stdout and
+makes the exit status 1. With several models, check the exit status before
+matching lines to models.
 
 ## Ranking policy
 
