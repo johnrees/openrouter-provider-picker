@@ -64,6 +64,9 @@ Options:
                               has a datacenter in this ISO country (repeatable
                               or comma-separated: -x CN,RU). Providers with no
                               known location are kept and shown with "?".
+      --zdr                   Keep only zero-data-retention endpoints, per
+                              OpenRouter's ZDR list. The zdr column shows each
+                              endpoint's status either way.
       --verify                Send a tiny completion through each candidate's
                               pin, best first, until one serves (needs a key)
       --json                  Print machine-readable results
@@ -82,6 +85,7 @@ type Percentiles = { p50?: number | null; p75?: number | null; p90?: number | nu
 
 /** The fields this tool reads from an entry of GET /models/{slug}/endpoints. */
 export type Endpoint = {
+  model_id?: string | null;
   provider_name: string;
   /** Unique per endpoint, e.g. "baseten/fp4/us". provider_name is not unique. */
   tag: string;
@@ -120,6 +124,7 @@ export type Options = {
   slugs: string[];
   provider?: string;
   excludeCountries: string[];
+  zdr: boolean;
   verify: boolean;
   json: boolean;
   pick: boolean;
@@ -136,6 +141,7 @@ export function parseOptions(argv: string[]): Options {
     options: {
       provider: { type: "string", short: "p", multiple: true },
       "exclude-country": { type: "string", short: "x", multiple: true },
+      zdr: { type: "boolean" },
       verify: { type: "boolean" },
       json: { type: "boolean" },
       pick: { type: "boolean" },
@@ -160,6 +166,7 @@ export function parseOptions(argv: string[]): Options {
     slugs,
     provider,
     excludeCountries: [...new Set(excludeCountries)],
+    zdr: values.zdr ?? false,
     verify: values.verify ?? false,
     json: values.json ?? false,
     pick: values.pick ?? false,
@@ -403,6 +410,20 @@ async function fetchLocations(): Promise<Map<string, Location>> {
   return locations;
 }
 
+/** Keys an endpoint by model and tag, the identity OpenRouter's ZDR list uses. */
+const zdrKey = (model: string, tag: string): string => `${model}\u0000${tag}`;
+
+/** Every zero-data-retention endpoint, as zdrKey values. Public data, so no key is sent. */
+async function fetchZdr(): Promise<Set<string>> {
+  const raw = await getData("/endpoints/zdr");
+  if (!Array.isArray(raw)) throw new Error("unexpected response: no data array");
+  const keys = new Set<string>();
+  for (const ep of raw as { model_id?: unknown; tag?: unknown }[]) {
+    if (typeof ep?.model_id === "string" && typeof ep.tag === "string") keys.add(zdrKey(ep.model_id, ep.tag));
+  }
+  return keys;
+}
+
 type ChatResponse = {
   provider?: unknown;
   error?: { message?: unknown };
@@ -462,19 +483,27 @@ async function verify(slug: string, candidates: readonly Ranked[], auth: Auth): 
   return { probes };
 }
 
-type Context = { options: Options; auth?: Auth; locations?: Map<string, Location> };
+type Context = { options: Options; auth?: Auth; locations?: Map<string, Location>; zdr?: Set<string> };
 
 const locationOf = (ep: Endpoint, { locations }: Context): Location | undefined => locations?.get(providerSlug(ep));
+
+/** Whether an endpoint is zero-data-retention, or undefined when the ZDR list is unavailable. */
+const zdrOf = (ep: Endpoint, slug: string, { zdr }: Context): boolean | undefined =>
+  zdr?.has(zdrKey(ep.model_id ?? slug, ep.tag));
 
 async function buildReport(slug: string, ctx: Context): Promise<Report> {
   const { options, auth } = ctx;
   try {
     const { endpoints, malformed } = await fetchEndpoints(slug, auth);
-    const excludedBy = (ep: Endpoint) => locationReasons(locationOf(ep, ctx), options.excludeCountries);
+    const excludedBy = (ep: Endpoint) => [
+      ...locationReasons(locationOf(ep, ctx), options.excludeCountries),
+      ...(options.zdr && !zdrOf(ep, slug, ctx) ? ["not ZDR"] : []),
+    ];
     const kept = (ep: Endpoint) => options.provider === undefined || matchesProvider(ep, options.provider);
-    // Excluded countries are a hard constraint, so they leave before ranking and
-    // can't set the price guard's baseline. The provider filter is only a view:
-    // it applies after ranking so the guard still compares against the whole tier.
+    // Excluded countries and --zdr are hard constraints, so they apply before
+    // ranking and can't set the price guard's baseline. The provider filter is
+    // only a view: it applies after ranking so the guard still compares against
+    // the whole tier.
     const ranked = rank(endpoints.filter((ep) => !excludedBy(ep).length)).filter(({ endpoint }) => kept(endpoint));
     const ineligible = endpoints
       .filter(kept)
@@ -521,6 +550,7 @@ const fmtCount = (value: unknown): string => {
   if (n >= 10_000) return `${Math.round(n / 1_000)}k`;
   return n.toFixed(0);
 };
+const fmtZdr = (zdr: boolean | undefined): string => (zdr === undefined ? "?" : zdr ? "Y" : "-");
 const yesNo = (ep: Endpoint, parameter: string): string => (ep.supported_parameters.includes(parameter) ? "Y" : "-");
 const fmtWhere = (location: Location | undefined): [string, string] => [
   location?.headquarters ?? "?",
@@ -562,6 +592,7 @@ function renderReport(report: Report, ctx: Context): string {
       "quant",
       "hq",
       "dc",
+      "zdr",
       "up1d",
       "up30m",
       "up5m",
@@ -585,6 +616,7 @@ function renderReport(report: Report, ctx: Context): string {
       ep.tag,
       ep.quantization && ep.quantization !== "unknown" ? ep.quantization : "?",
       ...fmtWhere(locationOf(ep, ctx)),
+      fmtZdr(zdrOf(ep, report.slug, ctx)),
       fmtPct(ep.uptime_last_1d),
       fmtPct(ep.uptime_last_30m),
       fmtPct(ep.uptime_last_5m),
@@ -602,7 +634,7 @@ function renderReport(report: Report, ctx: Context): string {
       yesNo(ep, "reasoning_effort"),
       priceEliminated ? "price-elim" : "",
     ]);
-    lines.push(...table(header, rows, new Set([1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])));
+    lines.push(...table(header, rows, new Set([1, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])));
   } else {
     lines.push(`  no eligible endpoint${options.provider === undefined ? "" : " matches"}`);
   }
@@ -622,8 +654,10 @@ function renderReport(report: Report, ctx: Context): string {
   if (report.ineligible.length) {
     lines.push(`  ineligible:`);
     const width = Math.max(...report.ineligible.map(({ endpoint }) => endpoint.tag.length));
-    for (const { endpoint, reasons } of report.ineligible)
-      lines.push(`    ${endpoint.tag.padEnd(width)}  ${reasons.join("; ")}`);
+    for (const { endpoint, reasons } of report.ineligible) {
+      const zdr = fmtZdr(zdrOf(endpoint, report.slug, ctx));
+      lines.push(`    ${endpoint.tag.padEnd(width)}  zdr ${zdr}  ${reasons.join("; ")}`);
+    }
   }
   return lines.join("\n");
 }
@@ -651,6 +685,7 @@ function reportJson(report: Report, ctx: Context) {
         quantization: ep.quantization ?? null,
         headquarters: location?.headquarters ?? null,
         datacenters: location?.datacenters ?? null,
+        zdr: zdrOf(ep, report.slug, ctx) ?? null,
         uptime: {
           last1d: metric(ep.uptime_last_1d) ?? null,
           last30m: metric(ep.uptime_last_30m) ?? null,
@@ -676,6 +711,7 @@ function reportJson(report: Report, ctx: Context) {
     ineligible: report.ineligible.map(({ endpoint, reasons }) => ({
       endpoint: endpoint.tag,
       provider: endpoint.provider_name,
+      zdr: zdrOf(endpoint, report.slug, ctx) ?? null,
       reasons,
     })),
     ...(report.verification && {
@@ -711,20 +747,36 @@ export async function main(argv: string[]): Promise<number> {
     );
   }
 
-  let locations: Map<string, Location> | undefined;
-  try {
-    locations = await fetchLocations();
-  } catch (error) {
-    const why = sanitize(errorMessage(error));
-    if (options.excludeCountries.length) {
-      console.error(`${NAME}: cannot apply --exclude-country without provider locations (${why})`);
+  // Reference data for the location and ZDR columns. A filter that needs it
+  // can't run without it; otherwise its column just shows "?".
+  const settle = <T>(lookup: Promise<T>) =>
+    lookup.catch((error: unknown) => new Error(sanitize(errorMessage(error), auth?.key)));
+  const [locations, zdr] = await Promise.all([settle(fetchLocations()), settle(fetchZdr())]);
+  const lookups = [
+    {
+      result: locations,
+      what: "provider locations",
+      flag: "--exclude-country",
+      needed: options.excludeCountries.length > 0,
+    },
+    { result: zdr, what: "the ZDR endpoint list", flag: "--zdr", needed: options.zdr },
+  ];
+  for (const { result, what, flag, needed } of lookups) {
+    if (!(result instanceof Error)) continue;
+    if (needed) {
+      console.error(`${NAME}: cannot apply ${flag} without ${what} (${result.message})`);
       return 1;
     }
-    console.error(`${NAME}: provider locations unavailable (${why})`);
+    console.error(`${NAME}: ${what} unavailable (${result.message})`);
   }
 
   // Fetch every model concurrently, but print in argument order.
-  const ctx: Context = { options, auth, locations };
+  const ctx: Context = {
+    options,
+    auth,
+    locations: locations instanceof Error ? undefined : locations,
+    zdr: zdr instanceof Error ? undefined : zdr,
+  };
   const pending = options.slugs.map((slug) => buildReport(slug, ctx));
   let ok = true;
   if (options.pick) {
@@ -748,6 +800,7 @@ export async function main(argv: string[]): Promise<number> {
           generatedAt: new Date().toISOString(),
           authenticated: auth !== undefined,
           excludeCountries: options.excludeCountries,
+          zdrOnly: options.zdr,
           models: reports.map((report) => reportJson(report, ctx)),
         },
         null,
@@ -758,7 +811,8 @@ export async function main(argv: string[]): Promise<number> {
     console.log(`# OpenRouter endpoint ranking · ${new Date().toISOString()} · auth: ${auth?.source ?? "anonymous"}`);
     console.log(
       `# eligible: native tools, status 0, tool_choice ${TOOL_CHOICE_MODES.join("/")}` +
-        (options.excludeCountries.length ? `, not in ${options.excludeCountries.join("/")}` : ""),
+        (options.excludeCountries.length ? `, not in ${options.excludeCountries.join("/")}` : "") +
+        (options.zdr ? ", ZDR only" : ""),
     );
     console.log(
       `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties) > turn_s > maxout > $run; ` +

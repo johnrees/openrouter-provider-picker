@@ -42,6 +42,7 @@ describe("parseOptions", () => {
       slugs: ["z-ai/glm-5.3"],
       provider: undefined,
       excludeCountries: [],
+      zdr: false,
       verify: false,
       json: false,
       pick: false,
@@ -292,16 +293,32 @@ describe("end to end against a mocked OpenRouter", () => {
   const endpoints = [
     ep("together", { provider_name: "Together" }),
     ep("wafer/us", { provider_name: "Wafer", latency_last_30m: { p50: 900 } }),
+    ep("broken", { status: -2 }), // ZDR but ineligible: never ranked or probed
   ];
 
   /** Runs main against a fake OpenRouter whose router serves `servedBy(tag)` for each pinned probe. */
-  async function run(servedBy: (tag: string) => string | undefined, argv = ["m/x", "--verify"]) {
+  /** OpenRouter's ZDR list for the mock: only wafer/us is zero-data-retention. null makes the lookup fail. */
+  const ZDR_LIST = {
+    data: [
+      { model_id: "m/x", tag: "wafer/us" },
+      { model_id: "m/x", tag: "broken" },
+      { model_id: "n/y", tag: "wafer/us" },
+    ],
+  };
+
+  async function run(
+    servedBy: (tag: string) => string | undefined,
+    argv = ["m/x", "--verify"],
+    zdrList: unknown = ZDR_LIST,
+  ) {
     const calls: { url: string; init: RequestInit }[] = [];
     const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
     const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input: unknown, init: RequestInit = {}) => {
       const url = String(input);
       calls.push({ url, init });
       if (url.endsWith("/providers")) return json({ data: [] });
+      if (url.endsWith("/endpoints/zdr"))
+        return zdrList === null ? new Response("down", { status: 503 }) : json(zdrList);
       if (url.endsWith("/models/n/y/endpoints")) return json({ data: { endpoints: endpoints.slice(1) } });
       if (url.endsWith("/endpoints")) {
         await Bun.sleep(10); // m/x answers after n/y, so output order can't follow arrival order
@@ -362,6 +379,7 @@ describe("end to end against a mocked OpenRouter", () => {
     const auth = (url: string) =>
       (calls.find((call) => call.url.endsWith(url))?.init.headers as Record<string, string>).Authorization;
     expect(auth("/providers")).toBeUndefined();
+    expect(auth("/endpoints/zdr")).toBeUndefined();
     expect(auth("/endpoints")).toBe(`Bearer ${KEY}`);
     expect(output).not.toContain(KEY);
   });
@@ -390,5 +408,61 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(stdout).toBe("");
     expect(stderr).toContain("m/x: no candidate served after 2 probe(s)");
     expect(code).toBe(1);
+  });
+
+  test("without --zdr, a faster non-ZDR endpoint still wins", async () => {
+    const { stdout } = await run(() => undefined, ["m/x", "--pick"]);
+    expect(stdout).toBe("together");
+  });
+
+  test("--zdr keeps only ZDR endpoints and lists the rest as ineligible", async () => {
+    expect((await run(() => undefined, ["m/x", "--pick", "--zdr"])).stdout).toBe("wafer/us");
+    const { stdout } = await run(() => undefined, ["m/x", "--zdr"]);
+    expect(stdout).toMatch(/together +zdr - +not ZDR/);
+    expect(stdout).toContain("ZDR only");
+  });
+
+  test("the zdr column shows each endpoint's status, or ? when the list is unavailable", async () => {
+    // The table row's cells after the tag are quant, hq, dc, zdr.
+    const zdrCell = (stdout: string, tag: string) => {
+      const cells = stdout
+        .split("\n")
+        .find((line) => line.includes(` ${tag} `))!
+        .trim()
+        .split(/ +/);
+      return cells[cells.indexOf(tag) + 4];
+    };
+    const shown = await run(() => undefined, ["m/x"]);
+    expect(zdrCell(shown.stdout, "wafer/us")).toBe("Y");
+    expect(zdrCell(shown.stdout, "together")).toBe("-");
+    const unknown = await run(() => undefined, ["m/x"], null);
+    expect(zdrCell(unknown.stdout, "wafer/us")).toBe("?");
+    expect(unknown.stderr).toContain("ZDR endpoint list unavailable");
+    expect(unknown.code).toBe(0);
+  });
+
+  test("--zdr fails rather than guessing when the ZDR list is unavailable", async () => {
+    const { code, stdout, stderr } = await run(() => undefined, ["m/x", "--pick", "--zdr"], null);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("cannot apply --zdr");
+    expect(code).toBe(1);
+  });
+
+  test("--json reports zdr per endpoint", async () => {
+    const { stdout } = await run(() => undefined, ["m/x", "--json"]);
+    const ranked = JSON.parse(stdout).models[0].ranked as { endpoint: string; zdr: boolean | null }[];
+    expect(Object.fromEntries(ranked.map(({ endpoint, zdr }) => [endpoint, zdr]))).toEqual({
+      together: false,
+      "wafer/us": true,
+    });
+  });
+
+  test("ineligible endpoints show their ZDR status too", async () => {
+    const text = await run(() => undefined, ["m/x"]);
+    expect(text.stdout).toMatch(/broken +zdr Y +status -2/);
+    const { models } = JSON.parse((await run(() => undefined, ["m/x", "--json"])).stdout);
+    expect(models[0].ineligible).toEqual([
+      { endpoint: "broken", provider: "broken", zdr: true, reasons: ["status -2"] },
+    ]);
   });
 });
