@@ -310,6 +310,12 @@ describe("end to end against a mocked OpenRouter", () => {
    * Runs main against a fake OpenRouter whose router answers each pinned probe
    * as `servedBy(tag)`: a provider name, a raw Response, or no provider.
    */
+  /** A successful probe reply: the forced call to the probe's tool. */
+  const TOOL_CALL = {
+    finish_reason: "tool_calls",
+    message: { tool_calls: [{ type: "function", function: { name: "ok", arguments: "{}" } }] },
+  };
+
   async function run(
     servedBy: (tag: string) => string | Response | undefined,
     argv = ["m/x", "--verify"],
@@ -332,7 +338,7 @@ describe("end to end against a mocked OpenRouter", () => {
       if (served instanceof Response) return served;
       return json({
         ...(served && { provider: served }),
-        choices: [{ finish_reason: "stop", message: { content: "OK" } }],
+        choices: [TOOL_CALL],
       });
     }) as unknown as typeof fetch);
     const log = spyOn(console, "log").mockImplementation(() => {});
@@ -393,7 +399,7 @@ describe("end to end against a mocked OpenRouter", () => {
         tag === "together" && calls++ === 0 ? busy(status) : "Together",
       );
       expect(probes.map(({ provider }) => provider.only[0])).toEqual(["together", "together"]);
-      expect(output).toContain("probe together: ok (served by Together, finish=stop, after a retry)");
+      expect(output).toContain("probe together: ok (served by Together, finish=tool_calls, after a retry)");
       expect(output).toContain("verified pin: m/x:together");
       expect(output).not.toContain("busy;");
       expect(code).toBe(0);
@@ -413,6 +419,33 @@ describe("end to end against a mocked OpenRouter", () => {
     const limited = () => new Response(JSON.stringify({ error: { message: "Rate limited", code: 429 } }));
     const { output } = await run((tag) => (tag === "together" ? limited() : "Wafer"));
     expect(output).toContain("probe together: busy (HTTP 429 Rate limited, retried)");
+  });
+
+  test("the probe forces a tool call, and a text reply fails it", async () => {
+    const text = () =>
+      new Response(
+        JSON.stringify({ provider: "Together", choices: [{ finish_reason: "stop", message: { content: "OK" } }] }),
+      );
+    const { output, probes } = await run((tag) => (tag === "together" ? text() : "Wafer"));
+    expect(probes[0]).toMatchObject({ tool_choice: "required", tools: [{ function: { name: "ok" } }] });
+    expect(output).toContain("probe together: FAILED (no ok tool call despite tool_choice required, finish=stop)");
+    expect(output).toContain("verified pin: m/x:wafer/us");
+  });
+
+  test("--verify stops starting probes when its time budget runs out", async () => {
+    let now = 0;
+    const clock = spyOn(Date, "now").mockImplementation(() => (now += 100_000)); // 100s per reading
+    try {
+      const { code, output, probes, stdout } = await run(() => undefined);
+      expect(probes).toHaveLength(1);
+      expect(output).toContain("no candidate served after 1 probe(s) (1 not probed: --verify stops after 3 minutes)");
+      expect(code).toBe(1);
+      const json = await run(() => undefined, ["m/x", "--json", "--verify"]);
+      expect(JSON.parse(json.stdout).models[0].notProbed).toBe(1);
+      expect(stdout).not.toContain("verified pin");
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test("a hard failure is not retried", async () => {

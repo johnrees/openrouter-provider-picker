@@ -47,9 +47,12 @@ export const TOOL_CHOICE_MODES = ["none", "auto", "required", "function"] as con
 const NAME = "opp";
 const API = "https://openrouter.ai/api/v1";
 const FETCH_TIMEOUT_MS = 30_000;
-const PROBE_TIMEOUT_MS = 60_000;
-/** Room for a reasoning model to think briefly and still answer. */
-const PROBE_MAX_TOKENS = 256;
+/** Generous for a one-tool-call reply; a pin that takes longer is not one to pick. */
+const PROBE_TIMEOUT_MS = 30_000;
+/** Room for a reasoning model to think briefly and still call the tool. Measured calls used 5 to 146 tokens. */
+const PROBE_MAX_TOKENS = 512;
+/** --verify starts no new probe after this long, so a run of hanging endpoints can't stall it for many minutes. */
+const VERIFY_BUDGET_MS = 180_000;
 /** Probe failures that mean "busy, try again shortly" rather than "this route is broken". */
 const TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 /** Wait before retrying a transient failure, unless Retry-After asks for longer (up to the cap). */
@@ -76,10 +79,11 @@ Options:
       --zdr                   Keep only zero-data-retention endpoints, per
                               OpenRouter's ZDR list. The zdr column shows each
                               endpoint's status either way.
-      --verify                Send a tiny completion through each candidate's
-                              pin, best first, until one serves (needs a key).
-                              A busy endpoint (HTTP 429, 5xx) is retried once,
-                              then skipped and reported as busy.
+      --verify                Send a tiny request that must call a tool through
+                              each candidate's pin, best first, until one
+                              serves (needs a key). A busy endpoint (HTTP 429,
+                              5xx) is retried once, then skipped and reported
+                              as busy. Stops starting probes after 3 minutes.
       --json                  Print machine-readable results
       --pick                  Print only each model's chosen endpoint tag, one
                               line per model, e.g. wafer/us. A model with no
@@ -122,7 +126,8 @@ export type Ranked = { endpoint: Endpoint; cost: number | undefined; priceElimin
 export type Auth = { key: string; source: string };
 /** `busy` marks a failure that was still transient after one retry: a rate limit or overload, not a dead route. */
 type Probe = { endpoint: Endpoint; ok: boolean; busy: boolean; detail: string };
-type Verification = { probes: Probe[]; verified?: Endpoint };
+/** `unprobed` counts the candidates left untried when the time budget ran out. */
+type Verification = { probes: Probe[]; verified?: Endpoint; unprobed?: number };
 type Report = {
   slug: string;
   error?: string;
@@ -439,8 +444,10 @@ async function fetchZdr(): Promise<Set<string>> {
 type ChatResponse = {
   provider?: unknown;
   error?: { message?: unknown; code?: unknown };
-  choices?: { finish_reason?: unknown; message?: { content?: unknown; reasoning?: unknown } }[];
+  choices?: { finish_reason?: unknown; message?: { tool_calls?: unknown } }[];
 };
+
+const PROBE_TOOL = "ok";
 
 /** One probe request's outcome. `retryInMs` is set when the failure is transient. */
 type Attempt = { ok: boolean; detail: string; retryInMs?: number };
@@ -483,7 +490,10 @@ async function attempt(slug: string, ep: Endpoint, auth: Auth): Promise<Attempt>
         model: slug,
         provider: pinRouting(ep),
         max_tokens: PROBE_MAX_TOKENS,
-        messages: [{ role: "user", content: "Reply with exactly: OK" }],
+        // Eligibility trusts the endpoint's advertised tool support, so the probe exercises it.
+        tools: [{ type: "function", function: { name: PROBE_TOOL, parameters: { type: "object", properties: {} } } }],
+        tool_choice: "required",
+        messages: [{ role: "user", content: `Call the ${PROBE_TOOL} tool.` }],
       }),
     });
     const body = (await res.json().catch(() => null)) as ChatResponse | null;
@@ -499,12 +509,13 @@ async function attempt(slug: string, ep: Endpoint, auth: Auth): Promise<Attempt>
     if (servedBy.toLowerCase() !== ep.provider_name.toLowerCase()) return result(false, `served by ${servedBy}`);
     const choice = body?.choices?.[0];
     const finish = String(choice?.finish_reason ?? "none");
-    const said = [choice?.message?.content, choice?.message?.reasoning].some(
-      (text) => typeof text === "string" && text.trim() !== "",
-    );
-    return said
+    const calls = choice?.message?.tool_calls;
+    const called =
+      Array.isArray(calls) &&
+      calls.some((call: { function?: { name?: unknown } } | null) => call?.function?.name === PROBE_TOOL);
+    return called
       ? result(true, `served by ${servedBy}, finish=${finish}`)
-      : result(false, `empty completion, finish=${finish}`);
+      : result(false, `no ${PROBE_TOOL} tool call despite tool_choice required, finish=${finish}`);
   } catch (error) {
     return result(false, errorMessage(error));
   }
@@ -512,8 +523,10 @@ async function attempt(slug: string, ep: Endpoint, auth: Auth): Promise<Attempt>
 
 /** Probes candidates in rank order and stops at the first that serves. */
 async function verify(slug: string, candidates: readonly Ranked[], auth: Auth): Promise<Verification> {
+  const deadline = Date.now() + VERIFY_BUDGET_MS;
   const probes: Probe[] = [];
   for (const { endpoint } of candidates) {
+    if (Date.now() >= deadline) return { probes, unprobed: candidates.length - probes.length };
     const outcome = await probe(slug, endpoint, auth);
     probes.push(outcome);
     if (outcome.ok) return { probes, verified: endpoint };
@@ -564,11 +577,14 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
 const pickOf = (report: Report): Endpoint | undefined =>
   report.verification ? report.verification.verified : report.ranked[0]?.endpoint;
 
+const budgetNote = `--verify stops after ${VERIFY_BUDGET_MS / 60_000} minutes`;
+
 function noPickReason(report: Report): string {
   if (report.error) return `fetch failed: ${report.error}`;
   if (report.verification) {
-    const note = busyNote(report);
-    return `no candidate served after ${report.verification.probes.length} probe(s)${note && ` (${note})`}`;
+    const { probes, unprobed } = report.verification;
+    const notes = [busyNote(report), unprobed ? `${unprobed} not probed: ${budgetNote}` : ""].filter(Boolean);
+    return `no candidate served after ${probes.length} probe(s)${notes.length ? ` (${notes.join("; ")})` : ""}`;
   }
   return "no eligible endpoint";
 }
@@ -771,6 +787,7 @@ function reportJson(report: Report, ctx: Context) {
         busy,
         detail,
       })),
+      notProbed: report.verification.unprobed ?? 0,
     }),
   };
 }
