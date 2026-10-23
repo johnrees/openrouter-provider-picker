@@ -25,7 +25,7 @@ There's no build step, so edits and `git pull` take effect immediately.
 ```sh
 opp z-ai/glm-5.3            # ranked table and the pick (several models are fine)
 opp z-ai/glm-5.3 --pick     # just the chosen endpoint tag, e.g. wafer/us
-opp z-ai/glm-5.3 --verify   # send a tiny real request to prove the pick serves
+opp z-ai/glm-5.3 --verify   # prove the pick serves and makes a tool call
 opp z-ai/glm-5.3 --zdr      # zero-data-retention endpoints only
 opp z-ai/glm-5.3 -x RU      # drop providers headquartered or hosting in Russia
 opp z-ai/glm-5.3 -p baseten # only BaseTen's endpoints
