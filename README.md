@@ -27,7 +27,7 @@ opp z-ai/glm-5.3            # ranked table and the pick (several models are fine
 opp z-ai/glm-5.3 --pick     # just the chosen endpoint tag, e.g. wafer/us
 opp z-ai/glm-5.3 --verify   # send a tiny real request to prove the pick serves
 opp z-ai/glm-5.3 --zdr      # zero-data-retention endpoints only
-opp z-ai/glm-5.3 -x CN      # drop providers headquartered or hosting in China
+opp z-ai/glm-5.3 -x RU      # drop providers headquartered or hosting in Russia
 opp z-ai/glm-5.3 -p baseten # only BaseTen's endpoints
 opp z-ai/glm-5.3 --json     # machine-readable
 ```
