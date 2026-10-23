@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * provider-picker: rank OpenRouter's serving endpoints for a model and pick
+ * opp (openrouter-provider-picker): rank OpenRouter's serving endpoints for a model and pick
  * one to pin.
  *
  * OpenRouter's default router chooses a provider per request and silently
@@ -48,6 +48,8 @@ export const ROSTER: readonly string[] = [
   "qwen/qwen3.8-27b",
 ];
 
+/** The command name, as installed by package.json "bin". */
+const NAME = "opp";
 const API = "https://openrouter.ai/api/v1";
 const FETCH_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 60_000;
@@ -56,7 +58,7 @@ const PROBE_MAX_TOKENS = 256;
 const SLUG = /^[a-z0-9][\w.-]*\/[a-z0-9][\w.:-]*$/i;
 const COUNTRY = /^[A-Z]{2}$/;
 
-const USAGE = `Usage: provider-picker [model/slug ...] [options]
+const USAGE = `Usage: ${NAME} [model/slug ...] [options]
 
 Rank OpenRouter's serving endpoints for each model and pick one to pin.
 
@@ -700,7 +702,7 @@ export async function main(argv: string[]): Promise<number> {
   try {
     options = parseOptions(argv);
   } catch (error) {
-    console.error(`provider-picker: ${errorMessage(error)}\n\n${USAGE}`);
+    console.error(`${NAME}: ${errorMessage(error)}\n\n${USAGE}`);
     return 2;
   }
   if (options.help) {
@@ -710,12 +712,12 @@ export async function main(argv: string[]): Promise<number> {
 
   const auth = resolveAuth();
   if (options.verify && !auth) {
-    console.error("provider-picker: --verify sends real requests and needs an API key; set OPENROUTER_API_KEY");
+    console.error(`${NAME}: --verify sends real requests and needs an API key; set OPENROUTER_API_KEY`);
     return 2;
   }
   if (!auth) {
     console.error(
-      "provider-picker: no API key found. OpenRouter hides latency and throughput from anonymous callers, " +
+      `${NAME}: no API key found. OpenRouter hides latency and throughput from anonymous callers, ` +
         "so speed is not ranked. Set OPENROUTER_API_KEY.",
     );
   }
@@ -726,10 +728,10 @@ export async function main(argv: string[]): Promise<number> {
   } catch (error) {
     const why = sanitize(errorMessage(error));
     if (options.excludeCountries.length) {
-      console.error(`provider-picker: cannot apply --exclude-country without provider locations (${why})`);
+      console.error(`${NAME}: cannot apply --exclude-country without provider locations (${why})`);
       return 1;
     }
-    console.error(`provider-picker: provider locations unavailable (${why})`);
+    console.error(`${NAME}: provider locations unavailable (${why})`);
   }
 
   // Fetch every model concurrently, but print in argument order.
@@ -737,7 +739,7 @@ export async function main(argv: string[]): Promise<number> {
   const pending = options.slugs.map((slug) => buildReport(slug, ctx));
   let ok = true;
   if (options.pick) {
-    // stdout carries only tags, so `$(provider-picker model --pick)` captures just the answer.
+    // stdout carries only tags, so `$(opp model --pick)` captures just the answer.
     for (const next of pending) {
       const report = await next;
       const pick = pickOf(report);
@@ -745,7 +747,7 @@ export async function main(argv: string[]): Promise<number> {
         console.log(pick.tag);
       } else {
         ok = false;
-        console.error(`provider-picker: ${report.slug}: ${noPickReason(report)}`);
+        console.error(`${NAME}: ${report.slug}: ${noPickReason(report)}`);
       }
     }
   } else if (options.json) {
