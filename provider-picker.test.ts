@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import {
   type Endpoint,
   ROSTER,
+  fmtRate,
   ineligibleReasons,
   locationReasons,
   main,
@@ -117,6 +118,15 @@ describe("prices", () => {
   test("without a cache-read price, cached tokens bill at the input rate", () => {
     const noCache = ep("a", { pricing: { prompt: "0.000001", completion: "0.000004" } });
     expect(referenceRunCost(noCache)).toBeCloseTo(0.5 + 7 + 0.12);
+  });
+
+  test("display keeps integer zeros and avoids exponents", () => {
+    expect(fmtRate("0.0001")).toBe("100");
+    expect(fmtRate("0.00001")).toBe("10");
+    expect(fmtRate("0.0000014")).toBe("1.4");
+    expect(fmtRate("0.000000079")).toBe("0.079");
+    expect(fmtRate("0.0012345")).toBe("1230");
+    expect(fmtRate(undefined)).toBe("-");
   });
 
   test("missing input or output price makes the cost unknown", () => {
@@ -247,5 +257,80 @@ describe("main", () => {
       error.mockRestore();
       log.mockRestore();
     }
+  });
+});
+
+describe("--verify end to end", () => {
+  const KEY = "sk-or-v1-test-secret-key";
+  // "together" ranks first on TTFB, so it is probed first.
+  const endpoints = [
+    ep("together", { provider_name: "Together" }),
+    ep("wafer/us", { provider_name: "Wafer", latency_last_30m: { p50: 900 } }),
+  ];
+
+  /** Runs main against a fake OpenRouter whose router serves `servedBy(tag)` for each pinned probe. */
+  async function run(servedBy: (tag: string) => string | undefined) {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input: unknown, init: RequestInit = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith("/providers")) return json({ data: [] });
+      if (url.endsWith("/endpoints")) return json({ data: { endpoints } });
+      const served = servedBy(JSON.parse(String(init.body)).provider.only[0]);
+      return json({
+        ...(served && { provider: served }),
+        choices: [{ finish_reason: "stop", message: { content: "OK" } }],
+      });
+    }) as unknown as typeof fetch);
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    const saved = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = KEY;
+    try {
+      const code = await main(["m/x", "--verify"]);
+      const output = [...log.mock.calls, ...error.mock.calls].flat().join("\n");
+      const probes = calls
+        .filter(({ url }) => url.endsWith("/chat/completions"))
+        .map(({ init }) => JSON.parse(String(init.body)));
+      return { code, output, calls, probes };
+    } finally {
+      if (saved === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = saved;
+      fetchMock.mockRestore();
+      log.mockRestore();
+      error.mockRestore();
+    }
+  }
+
+  test("a probe served by a different provider is rejected and the walk continues", async () => {
+    // The original bug: the router ignored the pin and Wafer served everything.
+    const { code, output, probes } = await run(() => "Wafer");
+    expect(probes.map(({ model, provider }) => ({ model, provider }))).toEqual([
+      { model: "m/x", provider: { only: ["together"], allow_fallbacks: false } },
+      { model: "m/x", provider: { only: ["wafer/us"], allow_fallbacks: false } },
+    ]);
+    expect(output).toContain("probe together: FAILED (served by Wafer)");
+    expect(output).toContain("verified pin: m/x:wafer/us");
+    expect(code).toBe(0);
+  });
+
+  test("a response with no provider is rejected, and no serving candidate exits 1", async () => {
+    const { code, output, probes } = await run(() => undefined);
+    expect(probes).toHaveLength(2);
+    expect(output).toContain("served by an unknown provider");
+    expect(output).toContain("no candidate served after 2 probe(s)");
+    expect(output).not.toContain("verified pin");
+    expect(code).toBe(1);
+  });
+
+  test("the key goes only where it is needed and is never printed", async () => {
+    const { output, calls } = await run((tag) => (tag === "together" ? "Together" : undefined));
+    expect(calls.every(({ init }) => init.redirect === "error")).toBe(true);
+    const auth = (url: string) =>
+      (calls.find((call) => call.url.endsWith(url))?.init.headers as Record<string, string>).Authorization;
+    expect(auth("/providers")).toBeUndefined();
+    expect(auth("/endpoints")).toBe(`Bearer ${KEY}`);
+    expect(output).not.toContain(KEY);
   });
 });

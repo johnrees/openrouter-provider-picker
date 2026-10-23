@@ -505,12 +505,11 @@ const dash = (value: string | undefined): string => value ?? "-";
 const fmtPct = (value: unknown): string => dash(metric(value)?.toFixed(1).replace(/\.0$/, ""));
 const fmtInt = (value: unknown): string => dash(metric(value)?.toFixed(0));
 const fmtSeconds = (ms: number | undefined): string => dash(ms === undefined ? undefined : (ms / 1000).toFixed(1));
-const fmtRate = (rate: string | null | undefined): string =>
-  dash(
-    perMillion(rate)
-      ?.toPrecision(3)
-      .replace(/\.?0+$/, ""),
-  );
+/** Three significant figures without trailing zeros or exponent notation: 100, 1.4, 0.079, 1230. */
+export const fmtRate = (rate: string | null | undefined): string => {
+  const usd = perMillion(rate);
+  return usd === undefined ? "-" : String(Number(usd.toPrecision(3)));
+};
 const fmtCount = (value: unknown): string => {
   const n = metric(value);
   if (n === undefined) return "-";
