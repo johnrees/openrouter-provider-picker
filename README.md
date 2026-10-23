@@ -40,11 +40,11 @@ and this README are packed.
 
 ```text
 ## z-ai/glm-5.3 · 26 of 48 eligible
-      #  endpoint           quant  hq  dc  up1d  up30m  up5m  turn_s  ttfb  tok/s  reqs  maxout    $in  $cache  $out  $run  …  note
-  ▶   1  wafer/us           fp4    US  ?    100    100   100     3.0   443    116   58k    944k  0.079   0.078   1.4  0.63
-      2  wafer/fp4          fp4    US  ?    100    100   100     3.1   380    109   22k    944k  0.179   0.178   1.4  1.38
+      #  endpoint           quant  hq  dc  zdr  up1d  up30m  up5m  turn_s  ttfb  tok/s  reqs  maxout    $in  $cache  $out  $run  …  note
+  ▶   1  wafer/us           fp4    US  ?   Y     100    100   100     3.0   443    116   58k    944k  0.079   0.078   1.4  0.63
+      2  wafer/fp4          fp4    US  ?   Y     100    100   100     3.1   380    109   22k    944k  0.179   0.178   1.4  1.38
       …
-     13  together           ?      US  ?    100    100   100     3.7   755    103  4837    944k    1.4    0.26   4.4  2.65     price-elim
+     13  together           ?      US  ?   Y     100    100   100     3.7   755    103  4837    944k    1.4    0.26   4.4  2.65     price-elim
       …
   probe wafer/us: ok (served by Wafer, finish=stop)
   verified pin: z-ai/glm-5.3:wafer/us
@@ -137,6 +137,22 @@ The constants at the top of `provider-picker.ts` hold every threshold.
   excluded. OpenRouter lists some Chinese companies under a Singapore entity:
   Z.AI's headquarters show as `SG`, for example. Check the `hq` and `dc`
   columns for anything that matters.
+- `--zdr` keeps only zero-data-retention endpoints: providers that store no
+  prompts or completions, and so can't train on them. Like `-x`, it applies
+  before ranking, and the dropped endpoints are listed as "not ZDR". The list
+  is OpenRouter's (`/endpoints/zdr`).
+
+  The `zdr` column (and `zdr` in `--json`) shows every endpoint's status
+  whether or not you filter. Without `--zdr`, a faster or cheaper non-ZDR
+  endpoint can still be the pick. With it, if the ZDR list can't be fetched,
+  the run fails rather than guess. In practice ZDR rarely costs anything:
+  most large hosts are on the list. In one check of six popular models, every
+  pick was already ZDR, and only 5 of 91 eligible endpoints weren't, none of
+  them ranked above #11.
+
+  If your OpenRouter account already denies providers that train on prompts,
+  OpenRouter enforces that when it routes, so `--verify` respects it too.
+  `--zdr` is stricter, and works without `--verify`.
 
 ## `--verify`
 
@@ -156,8 +172,8 @@ key comes from `OPENROUTER_API_KEY`, or from opencode's credential store
 the tool still ranks, but without speed data. `--verify` requires a key.
 
 The key is sent only to `https://openrouter.ai`. Redirects are refused, so it
-can never be forwarded to another host. The provider-location lookup is public
-and is sent without the key. The key is never printed. Upstream error text is
+can never be forwarded to another host. The provider-location and ZDR lookups
+are public and are sent without the key. The key is never printed. Upstream error text is
 scrubbed of the key and anything shaped like `sk-or-…` before display, and
 terminal control characters are stripped. Both happen before truncation.
 
