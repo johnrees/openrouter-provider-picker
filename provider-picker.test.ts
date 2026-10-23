@@ -167,9 +167,10 @@ describe("rank", () => {
   });
 
   test("without throughput, time to first token decides speed", () => {
-    const quick = ep("quick", { throughput_last_30m: null, latency_last_30m: { p50: 200 } });
-    const slow = ep("slow", { throughput_last_30m: null, latency_last_30m: { p50: 800 } });
-    expect(tags([slow, quick])).toEqual(["quick", "slow"]);
+    // Tags sort the other way, so only the TTFB key can put "z-quick" first.
+    const quick = ep("z-quick", { throughput_last_30m: null, latency_last_30m: { p50: 200 } });
+    const slow = ep("a-slow", { throughput_last_30m: null, latency_last_30m: { p50: 800 } });
+    expect(tags([slow, quick])).toEqual(["z-quick", "a-slow"]);
   });
 
   test("below saturation, the 1-day window outranks the 30-minute one", () => {
