@@ -45,6 +45,7 @@ describe("parseOptions", () => {
       excludeCountries: [],
       verify: false,
       json: false,
+      pick: false,
       help: false,
     });
   });
@@ -66,6 +67,7 @@ describe("parseOptions", () => {
     [["../etc/passwd"], /not a model slug/],
     [["a/.."], /not a model slug/],
     [["-x", "china"], /two-letter country code/],
+    [["--json", "--pick"], /alternative outputs/],
     [["--nope"], /Unknown option/],
   ])("rejects %j", (argv, message) => {
     expect(() => parseOptions(argv)).toThrow(message);
@@ -260,7 +262,7 @@ describe("main", () => {
   });
 });
 
-describe("--verify end to end", () => {
+describe("end to end against a mocked OpenRouter", () => {
   const KEY = "sk-or-v1-test-secret-key";
   // "together" ranks first on TTFB, so it is probed first.
   const endpoints = [
@@ -269,14 +271,18 @@ describe("--verify end to end", () => {
   ];
 
   /** Runs main against a fake OpenRouter whose router serves `servedBy(tag)` for each pinned probe. */
-  async function run(servedBy: (tag: string) => string | undefined) {
+  async function run(servedBy: (tag: string) => string | undefined, argv = ["m/x", "--verify"]) {
     const calls: { url: string; init: RequestInit }[] = [];
     const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
     const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input: unknown, init: RequestInit = {}) => {
       const url = String(input);
       calls.push({ url, init });
       if (url.endsWith("/providers")) return json({ data: [] });
-      if (url.endsWith("/endpoints")) return json({ data: { endpoints } });
+      if (url.endsWith("/models/n/y/endpoints")) return json({ data: { endpoints: endpoints.slice(1) } });
+      if (url.endsWith("/endpoints")) {
+        await Bun.sleep(10); // m/x answers after n/y, so output order can't follow arrival order
+        return json({ data: { endpoints } });
+      }
       const served = servedBy(JSON.parse(String(init.body)).provider.only[0]);
       return json({
         ...(served && { provider: served }),
@@ -288,12 +294,14 @@ describe("--verify end to end", () => {
     const saved = process.env.OPENROUTER_API_KEY;
     process.env.OPENROUTER_API_KEY = KEY;
     try {
-      const code = await main(["m/x", "--verify"]);
-      const output = [...log.mock.calls, ...error.mock.calls].flat().join("\n");
+      const code = await main(argv);
+      const stdout = log.mock.calls.flat().join("\n");
+      const stderr = error.mock.calls.flat().join("\n");
+      const output = `${stdout}\n${stderr}`;
       const probes = calls
         .filter(({ url }) => url.endsWith("/chat/completions"))
         .map(({ init }) => JSON.parse(String(init.body)));
-      return { code, output, calls, probes };
+      return { code, stdout, stderr, output, calls, probes };
     } finally {
       if (saved === undefined) delete process.env.OPENROUTER_API_KEY;
       else process.env.OPENROUTER_API_KEY = saved;
@@ -332,5 +340,31 @@ describe("--verify end to end", () => {
     expect(auth("/providers")).toBeUndefined();
     expect(auth("/endpoints")).toBe(`Bearer ${KEY}`);
     expect(output).not.toContain(KEY);
+  });
+
+  test("--pick prints only the chosen tag", async () => {
+    const { code, stdout, probes } = await run(() => undefined, ["m/x", "--pick"]);
+    expect(stdout).toBe("together");
+    expect(probes).toHaveLength(0);
+    expect(code).toBe(0);
+  });
+
+  test("--pick prints one line per model, in argument order", async () => {
+    // n/y offers only wafer/us and its fetch finishes first.
+    expect((await run(() => undefined, ["m/x", "n/y", "--pick"])).stdout).toBe("together\nwafer/us");
+    expect((await run(() => undefined, ["n/y", "m/x", "--pick"])).stdout).toBe("wafer/us\ntogether");
+  });
+
+  test("--pick with --verify prints the verified tag", async () => {
+    const { code, stdout } = await run(() => "Wafer", ["m/x", "--pick", "--verify"]);
+    expect(stdout).toBe("wafer/us");
+    expect(code).toBe(0);
+  });
+
+  test("--pick with no pick keeps stdout empty and explains on stderr", async () => {
+    const { code, stdout, stderr } = await run(() => undefined, ["m/x", "--pick", "--verify"]);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("m/x: no candidate served after 2 probe(s)");
+    expect(code).toBe(1);
   });
 });

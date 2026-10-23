@@ -74,6 +74,9 @@ Options:
       --verify                Send a tiny completion through each candidate's
                               pin, best first, until one serves (needs a key)
       --json                  Print machine-readable results
+      --pick                  Print only each model's chosen endpoint tag, one
+                              line per model, e.g. wafer/us. A model with no
+                              pick prints its reason to stderr instead.
   -h, --help                  Show this help
 
 Default roster:
@@ -129,6 +132,7 @@ export type Options = {
   excludeCountries: string[];
   verify: boolean;
   json: boolean;
+  pick: boolean;
   help: boolean;
 };
 
@@ -144,9 +148,11 @@ export function parseOptions(argv: string[]): Options {
       "exclude-country": { type: "string", short: "x", multiple: true },
       verify: { type: "boolean" },
       json: { type: "boolean" },
+      pick: { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
   });
+  if (values.json && values.pick) throw new Error("--json and --pick are alternative outputs; give one");
   const slugs = positionals.filter((arg) => arg.includes("/"));
   const filters = [...(values.provider ?? []), ...positionals.filter((arg) => !arg.includes("/"))];
   if (filters.length > 1) throw new Error(`give at most one provider filter, got ${filters.join(", ")}`);
@@ -165,6 +171,7 @@ export function parseOptions(argv: string[]): Options {
     excludeCountries: [...new Set(excludeCountries)],
     verify: values.verify ?? false,
     json: values.json ?? false,
+    pick: values.pick ?? false,
     help: values.help ?? false,
   };
 }
@@ -499,6 +506,12 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
 const pickOf = (report: Report): Endpoint | undefined =>
   report.verification ? report.verification.verified : report.ranked[0]?.endpoint;
 
+function noPickReason(report: Report): string {
+  if (report.error) return `fetch failed: ${report.error}`;
+  if (report.verification) return `no candidate served after ${report.verification.probes.length} probe(s)`;
+  return "no eligible endpoint";
+}
+
 // ---- Rendering --------------------------------------------------------------
 
 const dash = (value: string | undefined): string => value ?? "-";
@@ -723,7 +736,19 @@ export async function main(argv: string[]): Promise<number> {
   const ctx: Context = { options, auth, locations };
   const pending = options.slugs.map((slug) => buildReport(slug, ctx));
   let ok = true;
-  if (options.json) {
+  if (options.pick) {
+    // stdout carries only tags, so `$(provider-picker model --pick)` captures just the answer.
+    for (const next of pending) {
+      const report = await next;
+      const pick = pickOf(report);
+      if (pick) {
+        console.log(pick.tag);
+      } else {
+        ok = false;
+        console.error(`provider-picker: ${report.slug}: ${noPickReason(report)}`);
+      }
+    }
+  } else if (options.json) {
     const reports = await Promise.all(pending);
     ok = reports.every((report) => pickOf(report) !== undefined);
     console.log(
