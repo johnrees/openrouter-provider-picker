@@ -11,8 +11,7 @@ silent reroute makes a run impossible to attribute. Pinning one endpoint makes
 an outage fail loudly instead.
 
 ```sh
-opp                         # rank the default roster
-opp z-ai/glm-5.3            # rank specific models
+opp z-ai/glm-5.3            # rank one model's endpoints (name as many models as you like)
 opp z-ai/glm-5.3 -x CN      # drop providers based or hosting in China
 opp z-ai/glm-5.3 -p baseten # only BaseTen's endpoints (or a bare word: … baseten)
 opp z-ai/glm-5.3 --verify   # prove the pick serves for this account
@@ -29,8 +28,10 @@ dependencies. From a clone, link the script onto your PATH:
 ln -s "$PWD/provider-picker.ts" ~/.local/bin/opp
 ```
 
-Because it's a symlink, a `git pull` updates it. Without installing, run
-`./provider-picker.ts` from the clone instead.
+Because it's a symlink and Bun runs TypeScript directly, there's no build step:
+every run uses the current file, so an edit or a `git pull` takes effect
+immediately. That includes switching branches in the clone. Without
+installing, run `./provider-picker.ts` from the clone instead.
 
 `package.json` maps `opp` to the script under `bin`, so an npm install creates
 the same command whatever the package is published as. It is marked `private`

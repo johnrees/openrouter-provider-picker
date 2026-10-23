@@ -38,15 +38,6 @@ export const PRICE_ELIM_DELTA_USD = 1;
 export const REFERENCE_RUN = { prompt: 500_000, cacheRead: 7_000_000, completion: 30_000 } as const;
 /** An endpoint missing any of these silently degrades agent loops, so it is ineligible. */
 export const TOOL_CHOICE_MODES = ["none", "auto", "required", "function"] as const;
-/** Models ranked when none are named. */
-export const ROSTER: readonly string[] = [
-  "xiaomi/mimo-v2.6-flash",
-  "deepseek/deepseek-v4.1-flash-1017",
-  "z-ai/glm-5.3",
-  "z-ai/glm-5.3-flash",
-  "minimax/minimax-m3.1-flash",
-  "qwen/qwen3.8-27b",
-];
 
 /** The command name, as installed by package.json "bin". */
 const NAME = "opp";
@@ -58,12 +49,12 @@ const PROBE_MAX_TOKENS = 256;
 const SLUG = /^[a-z0-9][\w.-]*\/[a-z0-9][\w.:-]*$/i;
 const COUNTRY = /^[A-Z]{2}$/;
 
-const USAGE = `Usage: ${NAME} [model/slug ...] [options]
+const USAGE = `Usage: ${NAME} <model/slug ...> [options]
 
 Rank OpenRouter's serving endpoints for each model and pick one to pin.
 
 Arguments:
-  model/slug ...              Models to rank (default: the roster below)
+  model/slug ...              One or more models to rank, e.g. z-ai/glm-5.3
 
 Options:
   -p, --provider <name>       Keep endpoints whose provider name or tag
@@ -80,9 +71,6 @@ Options:
                               line per model, e.g. wafer/us. A model with no
                               pick prints its reason to stderr instead.
   -h, --help                  Show this help
-
-Default roster:
-${ROSTER.map((slug) => `  ${slug}`).join("\n")}
 
 Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential.
 Exit status: 0 if every model has a pick, 1 if any has none, 2 on usage errors.`;
@@ -160,6 +148,7 @@ export function parseOptions(argv: string[]): Options {
   if (filters.length > 1) throw new Error(`give at most one provider filter, got ${filters.join(", ")}`);
   const provider = filters[0]?.trim();
   if (provider === "") throw new Error("provider filter must not be empty");
+  if (!slugs.length && !values.help) throw new Error("give at least one model slug, e.g. z-ai/glm-5.3");
   const badSlug = slugs.find((slug) => !SLUG.test(slug));
   if (badSlug !== undefined) throw new Error(`not a model slug: ${badSlug}`);
   const excludeCountries = (values["exclude-country"] ?? [])
@@ -168,7 +157,7 @@ export function parseOptions(argv: string[]): Options {
   const badCountry = excludeCountries.find((code) => !COUNTRY.test(code));
   if (badCountry !== undefined) throw new Error(`not a two-letter country code: ${JSON.stringify(badCountry)}`);
   return {
-    slugs: slugs.length ? slugs : [...ROSTER],
+    slugs,
     provider,
     excludeCountries: [...new Set(excludeCountries)],
     verify: values.verify ?? false,
