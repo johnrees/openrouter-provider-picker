@@ -461,6 +461,18 @@ type ChatResponse = {
 
 const PROBE_TOOL = "ok";
 
+/** Tool-call arguments as a JSON object string; empty means no arguments. */
+function isArgumentObject(args: unknown): boolean {
+  if (args === "") return true;
+  if (typeof args !== "string") return false;
+  try {
+    const parsed: unknown = JSON.parse(args);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
+}
+
 /** One probe request's outcome. `retryInMs` is set when the failure is transient. */
 type Attempt = { ok: boolean; detail: string; retryInMs?: number };
 
@@ -522,12 +534,17 @@ async function attempt(slug: string, ep: Endpoint, auth: Auth): Promise<Attempt>
     const choice = body?.choices?.[0];
     const finish = String(choice?.finish_reason ?? "none");
     const calls = choice?.message?.tool_calls;
-    const called =
-      Array.isArray(calls) &&
-      calls.some((call: { function?: { name?: unknown } } | null) => call?.function?.name === PROBE_TOOL);
-    return called
-      ? result(true, `served by ${servedBy}, finish=${finish}`)
-      : result(false, `no ${PROBE_TOOL} tool call despite tool_choice required, finish=${finish}`);
+    const call = Array.isArray(calls)
+      ? (calls as ({ function?: { name?: unknown; arguments?: unknown } } | null)[]).find(
+          (c) => c?.function?.name === PROBE_TOOL,
+        )
+      : undefined;
+    if (!call) return result(false, `no ${PROBE_TOOL} tool call despite tool_choice required, finish=${finish}`);
+    // A call cut off by max_tokens, or with arguments an agent can't parse, is no use to an agent loop.
+    if (finish === "length" || !isArgumentObject(call.function?.arguments)) {
+      return result(false, `unusable ${PROBE_TOOL} tool call, finish=${finish}`);
+    }
+    return result(true, `served by ${servedBy}, finish=${finish}`);
   } catch (error) {
     return result(false, errorMessage(error));
   }

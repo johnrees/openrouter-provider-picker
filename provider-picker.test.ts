@@ -486,6 +486,26 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(output).toContain("verified pin: m/x:wafer/us");
   });
 
+  test.each([
+    ["truncated arguments", "length", "{"],
+    ["arguments that are not JSON", "tool_calls", "ok"],
+    ["arguments that are not an object", "tool_calls", "[]"],
+    ["a call cut off at max_tokens", "length", "{}"],
+  ])("a tool call with %s fails the probe", async (_, finish, args) => {
+    const call = () =>
+      new Response(
+        JSON.stringify({
+          provider: "Together",
+          choices: [
+            { finish_reason: finish, message: { tool_calls: [{ function: { name: "ok", arguments: args } }] } },
+          ],
+        }),
+      );
+    const { output } = await run((tag) => (tag === "together" ? call() : "Wafer"));
+    expect(output).toContain(`probe together: FAILED (unusable ok tool call, finish=${finish})`);
+    expect(output).toContain("verified pin: m/x:wafer/us");
+  });
+
   test("--verify stops starting probes when its time budget runs out", async () => {
     let now = 0;
     const clock = spyOn(Date, "now").mockImplementation(() => (now += 100_000)); // 100s per reading
