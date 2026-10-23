@@ -1,0 +1,14 @@
+{
+  "name": "openrouter-provider-picker",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "provider-picker": "./provider-picker.ts"
+  },
+  "scripts": {
+    "pick": "bun provider-picker.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4"
+  }
+}
