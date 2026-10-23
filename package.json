@@ -1,10 +1,14 @@
 {
   "name": "openrouter-provider-picker",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "bin": {
-    "provider-picker": "./provider-picker.ts"
+    "opp": "./provider-picker.ts"
   },
+  "files": [
+    "provider-picker.ts"
+  ],
   "scripts": {
     "pick": "bun provider-picker.ts"
   },

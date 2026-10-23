@@ -1,7 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import {
   type Endpoint,
-  ROSTER,
   fmtRate,
   ineligibleReasons,
   locationReasons,
@@ -38,9 +37,9 @@ function ep(tag: string, overrides: Partial<Endpoint> = {}): Endpoint {
 const tags = (endpoints: Endpoint[]) => rank(endpoints).map(({ endpoint }) => endpoint.tag);
 
 describe("parseOptions", () => {
-  test("defaults to the roster", () => {
-    expect(parseOptions([])).toEqual({
-      slugs: [...ROSTER],
+  test("defaults", () => {
+    expect(parseOptions(["z-ai/glm-5.3"])).toEqual({
+      slugs: ["z-ai/glm-5.3"],
       provider: undefined,
       excludeCountries: [],
       verify: false,
@@ -57,8 +56,12 @@ describe("parseOptions", () => {
     expect(options.verify).toBe(true);
   });
 
+  test("--help needs no model", () => {
+    expect(parseOptions(["--help"]).help).toBe(true);
+  });
+
   test("country codes are split, uppercased and deduplicated", () => {
-    expect(parseOptions(["-x", "cn,ru", "--exclude-country", "CN"]).excludeCountries).toEqual(["CN", "RU"]);
+    expect(parseOptions(["m/x", "-x", "cn,ru", "--exclude-country", "CN"]).excludeCountries).toEqual(["CN", "RU"]);
   });
 
   test.each([
@@ -66,8 +69,10 @@ describe("parseOptions", () => {
     [["--provider", " "], /must not be empty/],
     [["../etc/passwd"], /not a model slug/],
     [["a/.."], /not a model slug/],
-    [["-x", "china"], /two-letter country code/],
+    [["m/x", "-x", "china"], /two-letter country code/],
     [["--json", "--pick"], /alternative outputs/],
+    [[], /at least one model slug/],
+    [["together"], /at least one model slug/],
     [["--nope"], /Unknown option/],
   ])("rejects %j", (argv, message) => {
     expect(() => parseOptions(argv)).toThrow(message);
@@ -253,8 +258,27 @@ describe("main", () => {
     const log = spyOn(console, "log").mockImplementation(() => {});
     try {
       expect(await main(["--bogus"])).toBe(2);
+      expect(await main([])).toBe(2);
       expect(await main(["--help"])).toBe(0);
       expect(log.mock.calls[0]?.[0]).toContain("--exclude-country");
+    } finally {
+      error.mockRestore();
+      log.mockRestore();
+    }
+  });
+});
+
+describe("command name", () => {
+  test("package.json installs the script as opp, and it calls itself opp", async () => {
+    const pkg = await Bun.file(new URL("./package.json", import.meta.url)).json();
+    expect(pkg.bin).toEqual({ opp: "./provider-picker.ts" });
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await main(["--help"]);
+      await main(["--bogus"]);
+      expect(log.mock.calls[0]?.[0]).toStartWith("Usage: opp ");
+      expect(error.mock.calls[0]?.[0]).toStartWith("opp: ");
     } finally {
       error.mockRestore();
       log.mockRestore();

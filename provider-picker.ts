@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * provider-picker: rank OpenRouter's serving endpoints for a model and pick
+ * opp (openrouter-provider-picker): rank OpenRouter's serving endpoints for a model and pick
  * one to pin.
  *
  * OpenRouter's default router chooses a provider per request and silently
@@ -38,16 +38,9 @@ export const PRICE_ELIM_DELTA_USD = 1;
 export const REFERENCE_RUN = { prompt: 500_000, cacheRead: 7_000_000, completion: 30_000 } as const;
 /** An endpoint missing any of these silently degrades agent loops, so it is ineligible. */
 export const TOOL_CHOICE_MODES = ["none", "auto", "required", "function"] as const;
-/** Models ranked when none are named. */
-export const ROSTER: readonly string[] = [
-  "xiaomi/mimo-v2.6-flash",
-  "deepseek/deepseek-v4.1-flash-1017",
-  "z-ai/glm-5.3",
-  "z-ai/glm-5.3-flash",
-  "minimax/minimax-m3.1-flash",
-  "qwen/qwen3.8-27b",
-];
 
+/** The command name, as installed by package.json "bin". */
+const NAME = "opp";
 const API = "https://openrouter.ai/api/v1";
 const FETCH_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 60_000;
@@ -56,12 +49,12 @@ const PROBE_MAX_TOKENS = 256;
 const SLUG = /^[a-z0-9][\w.-]*\/[a-z0-9][\w.:-]*$/i;
 const COUNTRY = /^[A-Z]{2}$/;
 
-const USAGE = `Usage: provider-picker [model/slug ...] [options]
+const USAGE = `Usage: ${NAME} <model/slug ...> [options]
 
 Rank OpenRouter's serving endpoints for each model and pick one to pin.
 
 Arguments:
-  model/slug ...              Models to rank (default: the roster below)
+  model/slug ...              One or more models to rank, e.g. z-ai/glm-5.3
 
 Options:
   -p, --provider <name>       Keep endpoints whose provider name or tag
@@ -78,9 +71,6 @@ Options:
                               line per model, e.g. wafer/us. A model with no
                               pick prints its reason to stderr instead.
   -h, --help                  Show this help
-
-Default roster:
-${ROSTER.map((slug) => `  ${slug}`).join("\n")}
 
 Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential.
 Exit status: 0 if every model has a pick, 1 if any has none, 2 on usage errors.`;
@@ -158,6 +148,7 @@ export function parseOptions(argv: string[]): Options {
   if (filters.length > 1) throw new Error(`give at most one provider filter, got ${filters.join(", ")}`);
   const provider = filters[0]?.trim();
   if (provider === "") throw new Error("provider filter must not be empty");
+  if (!slugs.length && !values.help) throw new Error("give at least one model slug, e.g. z-ai/glm-5.3");
   const badSlug = slugs.find((slug) => !SLUG.test(slug));
   if (badSlug !== undefined) throw new Error(`not a model slug: ${badSlug}`);
   const excludeCountries = (values["exclude-country"] ?? [])
@@ -166,7 +157,7 @@ export function parseOptions(argv: string[]): Options {
   const badCountry = excludeCountries.find((code) => !COUNTRY.test(code));
   if (badCountry !== undefined) throw new Error(`not a two-letter country code: ${JSON.stringify(badCountry)}`);
   return {
-    slugs: slugs.length ? slugs : [...ROSTER],
+    slugs,
     provider,
     excludeCountries: [...new Set(excludeCountries)],
     verify: values.verify ?? false,
@@ -700,7 +691,7 @@ export async function main(argv: string[]): Promise<number> {
   try {
     options = parseOptions(argv);
   } catch (error) {
-    console.error(`provider-picker: ${errorMessage(error)}\n\n${USAGE}`);
+    console.error(`${NAME}: ${errorMessage(error)}\n\n${USAGE}`);
     return 2;
   }
   if (options.help) {
@@ -710,12 +701,12 @@ export async function main(argv: string[]): Promise<number> {
 
   const auth = resolveAuth();
   if (options.verify && !auth) {
-    console.error("provider-picker: --verify sends real requests and needs an API key; set OPENROUTER_API_KEY");
+    console.error(`${NAME}: --verify sends real requests and needs an API key; set OPENROUTER_API_KEY`);
     return 2;
   }
   if (!auth) {
     console.error(
-      "provider-picker: no API key found. OpenRouter hides latency and throughput from anonymous callers, " +
+      `${NAME}: no API key found. OpenRouter hides latency and throughput from anonymous callers, ` +
         "so speed is not ranked. Set OPENROUTER_API_KEY.",
     );
   }
@@ -726,10 +717,10 @@ export async function main(argv: string[]): Promise<number> {
   } catch (error) {
     const why = sanitize(errorMessage(error));
     if (options.excludeCountries.length) {
-      console.error(`provider-picker: cannot apply --exclude-country without provider locations (${why})`);
+      console.error(`${NAME}: cannot apply --exclude-country without provider locations (${why})`);
       return 1;
     }
-    console.error(`provider-picker: provider locations unavailable (${why})`);
+    console.error(`${NAME}: provider locations unavailable (${why})`);
   }
 
   // Fetch every model concurrently, but print in argument order.
@@ -737,7 +728,7 @@ export async function main(argv: string[]): Promise<number> {
   const pending = options.slugs.map((slug) => buildReport(slug, ctx));
   let ok = true;
   if (options.pick) {
-    // stdout carries only tags, so `$(provider-picker model --pick)` captures just the answer.
+    // stdout carries only tags, so `$(opp model --pick)` captures just the answer.
     for (const next of pending) {
       const report = await next;
       const pick = pickOf(report);
@@ -745,7 +736,7 @@ export async function main(argv: string[]): Promise<number> {
         console.log(pick.tag);
       } else {
         ok = false;
-        console.error(`provider-picker: ${report.slug}: ${noPickReason(report)}`);
+        console.error(`${NAME}: ${report.slug}: ${noPickReason(report)}`);
       }
     }
   } else if (options.json) {

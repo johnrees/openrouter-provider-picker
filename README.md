@@ -11,14 +11,32 @@ silent reroute makes a run impossible to attribute. Pinning one endpoint makes
 an outage fail loudly instead.
 
 ```sh
-./provider-picker.ts                         # rank the default roster
-./provider-picker.ts z-ai/glm-5.3            # rank specific models
-./provider-picker.ts z-ai/glm-5.3 -x CN      # drop providers based or hosting in China
-./provider-picker.ts z-ai/glm-5.3 -p baseten # only BaseTen's endpoints (or a bare word: … baseten)
-./provider-picker.ts z-ai/glm-5.3 --verify   # prove the pick serves for this account
-./provider-picker.ts z-ai/glm-5.3 --json     # machine-readable output
-./provider-picker.ts z-ai/glm-5.3 --pick     # just the chosen endpoint tag: wafer/us
+opp z-ai/glm-5.3            # rank one model's endpoints (name as many models as you like)
+opp z-ai/glm-5.3 -x CN      # drop providers based or hosting in China
+opp z-ai/glm-5.3 -p baseten # only BaseTen's endpoints (or a bare word: … baseten)
+opp z-ai/glm-5.3 --verify   # prove the pick serves for this account
+opp z-ai/glm-5.3 --json     # machine-readable output
+opp z-ai/glm-5.3 --pick     # just the chosen endpoint tag: wafer/us
 ```
+
+## Install
+
+The command is `opp`. It needs [Bun](https://bun.com) and has no other
+dependencies. From a clone, link the script onto your PATH:
+
+```sh
+ln -s "$PWD/provider-picker.ts" ~/.local/bin/opp
+```
+
+Because it's a symlink and Bun runs TypeScript directly, there's no build step:
+every run uses the current file, so an edit or a `git pull` takes effect
+immediately. That includes switching branches in the clone. Without
+installing, run `./provider-picker.ts` from the clone instead.
+
+`package.json` maps `opp` to the script under `bin`, so an npm install creates
+the same command whatever the package is published as. It is marked `private`
+to prevent an accidental publish; remove that line to publish. Only the script
+and this README are packed.
 
 ```text
 ## z-ai/glm-5.3 · 26 of 48 eligible
@@ -63,7 +81,7 @@ For scripts, `--pick` prints only the chosen tag, one line per model in
 argument order. It combines with every filter and with `--verify`:
 
 ```sh
-tag=$(./provider-picker.ts z-ai/glm-5.3 -x CN --verify --pick) || exit 1
+tag=$(opp z-ai/glm-5.3 -x CN --verify --pick) || exit 1
 ```
 
 A model with no pick writes its reason to stderr, prints nothing to stdout and
