@@ -278,7 +278,11 @@ describe("end to end against a mocked OpenRouter", () => {
       const url = String(input);
       calls.push({ url, init });
       if (url.endsWith("/providers")) return json({ data: [] });
-      if (url.endsWith("/endpoints")) return json({ data: { endpoints } });
+      if (url.endsWith("/models/n/y/endpoints")) return json({ data: { endpoints: endpoints.slice(1) } });
+      if (url.endsWith("/endpoints")) {
+        await Bun.sleep(10); // m/x answers after n/y, so output order can't follow arrival order
+        return json({ data: { endpoints } });
+      }
       const served = servedBy(JSON.parse(String(init.body)).provider.only[0]);
       return json({
         ...(served && { provider: served }),
@@ -345,9 +349,10 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(code).toBe(0);
   });
 
-  test("--pick prints one line per model, in order", async () => {
-    const { stdout } = await run(() => undefined, ["m/x", "n/y", "--pick"]);
-    expect(stdout).toBe("together\ntogether");
+  test("--pick prints one line per model, in argument order", async () => {
+    // n/y offers only wafer/us and its fetch finishes first.
+    expect((await run(() => undefined, ["m/x", "n/y", "--pick"])).stdout).toBe("together\nwafer/us");
+    expect((await run(() => undefined, ["n/y", "m/x", "--pick"])).stdout).toBe("wafer/us\ntogether");
   });
 
   test("--pick with --verify prints the verified tag", async () => {
