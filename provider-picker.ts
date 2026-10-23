@@ -50,6 +50,11 @@ const FETCH_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 60_000;
 /** Room for a reasoning model to think briefly and still answer. */
 const PROBE_MAX_TOKENS = 256;
+/** Probe failures that mean "busy, try again shortly" rather than "this route is broken". */
+const TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+/** Wait before retrying a transient failure, unless Retry-After asks for longer (up to the cap). */
+const PROBE_RETRY_MS = 2_000;
+const PROBE_RETRY_MAX_MS = 10_000;
 const SLUG = /^[a-z0-9][\w.-]*\/[a-z0-9][\w.:-]*$/i;
 const COUNTRY = /^[A-Z]{2}$/;
 
@@ -72,7 +77,9 @@ Options:
                               OpenRouter's ZDR list. The zdr column shows each
                               endpoint's status either way.
       --verify                Send a tiny completion through each candidate's
-                              pin, best first, until one serves (needs a key)
+                              pin, best first, until one serves (needs a key).
+                              A busy endpoint (HTTP 429, 5xx) is retried once,
+                              then skipped and reported as busy.
       --json                  Print machine-readable results
       --pick                  Print only each model's chosen endpoint tag, one
                               line per model, e.g. wafer/us. A model with no
@@ -113,7 +120,8 @@ export type Endpoint = {
 export type Location = { headquarters?: string | null; datacenters?: string[] | null };
 export type Ranked = { endpoint: Endpoint; cost: number | undefined; priceEliminated: boolean };
 export type Auth = { key: string; source: string };
-type Probe = { endpoint: Endpoint; ok: boolean; detail: string };
+/** `busy` marks a failure that was still transient after one retry: a rate limit or overload, not a dead route. */
+type Probe = { endpoint: Endpoint; ok: boolean; busy: boolean; detail: string };
 type Verification = { probes: Probe[]; verified?: Endpoint };
 type Report = {
   slug: string;
@@ -430,18 +438,41 @@ async function fetchZdr(): Promise<Set<string>> {
 
 type ChatResponse = {
   provider?: unknown;
-  error?: { message?: unknown };
+  error?: { message?: unknown; code?: unknown };
   choices?: { finish_reason?: unknown; message?: { content?: unknown; reasoning?: unknown } }[];
 };
 
+/** One probe request's outcome. `retryInMs` is set when the failure is transient. */
+type Attempt = { ok: boolean; detail: string; retryInMs?: number };
+
+/** How long to wait before retrying, from a Retry-After header in seconds, capped. */
+export function retryDelay(header: string | null): number {
+  const seconds = header === null || header.trim() === "" ? NaN : Number(header);
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds * 1000, PROBE_RETRY_MAX_MS) : PROBE_RETRY_MS;
+}
+
 /**
- * Sends one minimal completion pinned to `ep`. Account data controls, such as
- * zero-retention or data-collection exclusions, are enforced only at routing
- * time and appear in no API field. A real request is the only way to learn
- * whether this account can use an endpoint.
+ * Sends one minimal completion pinned to `ep`, retrying once if the endpoint
+ * is busy. Account data controls, such as zero-retention or data-collection
+ * exclusions, are enforced only at routing time and appear in no API field. A
+ * real request is the only way to learn whether this account can use an
+ * endpoint.
  */
 async function probe(slug: string, ep: Endpoint, auth: Auth): Promise<Probe> {
-  const result = (ok: boolean, detail: string): Probe => ({ endpoint: ep, ok, detail: sanitize(detail, auth.key) });
+  const first = await attempt(slug, ep, auth);
+  if (first.retryInMs === undefined) return { endpoint: ep, ok: first.ok, busy: false, detail: first.detail };
+  await Bun.sleep(first.retryInMs);
+  const second = await attempt(slug, ep, auth);
+  const busy = second.retryInMs !== undefined;
+  return { endpoint: ep, ok: second.ok, busy, detail: `${second.detail}, ${second.ok ? "after a retry" : "retried"}` };
+}
+
+async function attempt(slug: string, ep: Endpoint, auth: Auth): Promise<Attempt> {
+  const result = (ok: boolean, detail: string, retryInMs?: number): Attempt => ({
+    ok,
+    detail: sanitize(detail, auth.key),
+    ...(retryInMs !== undefined && { retryInMs }),
+  });
   try {
     const res = await fetch(`${API}/chat/completions`, {
       method: "POST",
@@ -458,7 +489,10 @@ async function probe(slug: string, ep: Endpoint, auth: Auth): Promise<Probe> {
     const body = (await res.json().catch(() => null)) as ChatResponse | null;
     const upstream = body?.error?.message;
     if (!res.ok || upstream != null) {
-      return result(false, `HTTP ${res.status}${upstream == null ? "" : ` ${String(upstream)}`}`);
+      // OpenRouter can also report an upstream rate limit as an error body on a 200.
+      const status = res.ok ? Number(body?.error?.code) : res.status;
+      const retryInMs = TRANSIENT_STATUSES.has(status) ? retryDelay(res.headers.get("retry-after")) : undefined;
+      return result(false, `HTTP ${status || res.status}${upstream == null ? "" : ` ${String(upstream)}`}`, retryInMs);
     }
     // Pinning makes this unreachable unless OpenRouter changes semantics. Check anyway, since verifying is the point.
     const servedBy = typeof body?.provider === "string" ? body.provider : "an unknown provider";
@@ -532,8 +566,18 @@ const pickOf = (report: Report): Endpoint | undefined =>
 
 function noPickReason(report: Report): string {
   if (report.error) return `fetch failed: ${report.error}`;
-  if (report.verification) return `no candidate served after ${report.verification.probes.length} probe(s)`;
+  if (report.verification) {
+    const note = busyNote(report);
+    return `no candidate served after ${report.verification.probes.length} probe(s)${note && ` (${note})`}`;
+  }
   return "no eligible endpoint";
+}
+
+/** Tags that were only busy when probed. A re-run may pick one of them instead. */
+/** Names the endpoints that were only busy when probed, since a re-run may pick one; "" when there are none. */
+function busyNote(report: Report): string {
+  const busy = report.verification?.probes.filter(({ busy }) => busy).map(({ endpoint }) => endpoint.tag) ?? [];
+  return busy.length ? `${busy.join(", ")} ${busy.length === 1 ? "was" : "were"} busy; re-run to retry` : "";
 }
 
 // ---- Rendering --------------------------------------------------------------
@@ -643,16 +687,18 @@ function renderReport(report: Report, ctx: Context): string {
     lines.push(`  no eligible endpoint${options.provider === undefined ? "" : " matches"}`);
   }
 
-  for (const { endpoint, ok, detail } of report.verification?.probes ?? []) {
-    lines.push(`  probe ${endpoint.tag}: ${ok ? "ok" : "FAILED"} (${detail})`);
+  for (const { endpoint, ok, busy, detail } of report.verification?.probes ?? []) {
+    lines.push(`  probe ${endpoint.tag}: ${ok ? "ok" : busy ? "busy" : "FAILED"} (${detail})`);
   }
   if (pick) {
     lines.push(
       `  ${report.verification ? "verified pin" : "pin"}: ${report.slug}:${pick.tag}`,
       `  routing: "provider": ${JSON.stringify(pinRouting(pick))}`,
     );
+    const note = busyNote(report);
+    if (note) lines.push(`  note: ${note}`);
   } else if (report.verification) {
-    lines.push(`  no candidate served after ${report.verification.probes.length} probe(s)`);
+    lines.push(`  ${noPickReason(report)}`);
   }
 
   if (report.ineligible.length) {
@@ -719,7 +765,12 @@ function reportJson(report: Report, ctx: Context) {
       reasons,
     })),
     ...(report.verification && {
-      probes: report.verification.probes.map(({ endpoint, ok, detail }) => ({ endpoint: endpoint.tag, ok, detail })),
+      probes: report.verification.probes.map(({ endpoint, ok, busy, detail }) => ({
+        endpoint: endpoint.tag,
+        ok,
+        busy,
+        detail,
+      })),
     }),
   };
 }
@@ -790,6 +841,8 @@ export async function main(argv: string[]): Promise<number> {
       const pick = pickOf(report);
       if (pick) {
         console.log(pick.tag);
+        const note = busyNote(report);
+        if (note) console.error(`${NAME}: ${report.slug}: picked ${pick.tag}, but ${note}`);
       } else {
         ok = false;
         console.error(`${NAME}: ${report.slug}: ${noPickReason(report)}`);
