@@ -1,0 +1,30 @@
+{
+  "reviewers": {
+    "codex": {
+      "model": "gpt-6-astra"
+    },
+    "claude": {
+      "model": "claude-opus-5-5"
+    }
+  },
+  "effort": {
+    "default": "high",
+    "rules": [
+      {
+        "labels": ["model:fable-*"],
+        "effort": "xhigh"
+      },
+      {
+        "labels": ["model:opus-*", "effort:xhigh"],
+        "effort": "xhigh"
+      },
+      {
+        "labels": ["model:opus-*", "effort:max"],
+        "effort": "xhigh"
+      }
+    ]
+  },
+  "checks": ["bun install --frozen-lockfile", "bun test", "bun check", "bun fmt --check"],
+  "waiver_label": "review-waived",
+  "block_on": "changes_requested"
+}
