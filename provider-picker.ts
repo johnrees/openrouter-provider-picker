@@ -14,6 +14,7 @@
  * README.md explains the policy. Run with --help for usage.
  */
 
+import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { parseArgs } from "node:util";
 
@@ -248,10 +249,14 @@ const uptimeBucket = (value: unknown): number | undefined => {
 const asc = (value: number | undefined): number => value ?? Infinity;
 const desc = (value: number | undefined): number => (value === undefined ? Infinity : -value);
 
-/** The 1-day window outranks the 30-minute one: a clean day beats a clean half hour. */
+/**
+ * The 1-day window outranks the 30-minute one: a clean day beats a clean half
+ * hour. An endpoint with no traffic in the last 30 minutes has no 30-minute
+ * uptime, so its day stands in rather than ranking it below a measured failure.
+ */
 const reliabilityKey = (ep: Endpoint): number[] => [
   desc(uptimeBucket(ep.uptime_last_1d)),
-  desc(uptimeBucket(ep.uptime_last_30m)),
+  desc(uptimeBucket(ep.uptime_last_30m) ?? uptimeBucket(ep.uptime_last_1d)),
 ];
 
 function compareKeys(a: readonly number[], b: readonly number[]): number {
@@ -323,19 +328,22 @@ export function resolveAuth(env: Record<string, string | undefined> = process.en
   const dataHome = env.XDG_DATA_HOME || (env.HOME && `${env.HOME}/.local/share`);
   const db = dataHome && `${dataHome}/opencode/opencode.db`;
   if (!db || !existsSync(db)) return undefined;
+  let sqlite: Database | undefined;
   try {
-    const proc = Bun.spawnSync(
-      ["sqlite3", "-readonly", db, "select value from credential where label = 'OpenRouter' and active = 1 limit 1"],
-      { stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 5_000 },
-    );
-    if (proc.exitCode !== 0) return undefined;
+    sqlite = new Database(db, { readonly: true });
+    const row = sqlite
+      .query<{ value: unknown }, []>("select value from credential where label = 'OpenRouter' and active = 1 limit 1")
+      .get();
+    if (typeof row?.value !== "string") return undefined;
     // The stored value is a JSON envelope, {"type":"key","key":"sk-or-..."}.
     // Anything else is ignored rather than sent as a bearer token.
-    const envelope = JSON.parse(proc.stdout.toString()) as { type?: unknown; key?: unknown } | null;
+    const envelope = JSON.parse(row.value) as { type?: unknown; key?: unknown } | null;
     const key = envelope?.type === "key" && typeof envelope.key === "string" ? envelope.key.trim() : "";
     return key ? { key, source: "opencode credential store" } : undefined;
   } catch {
-    return undefined; // no sqlite3, unreadable database, or a value that is not an envelope
+    return undefined; // unreadable database, a different schema, or a value that is not an envelope
+  } finally {
+    sqlite?.close();
   }
 }
 
@@ -360,8 +368,10 @@ const errorMessage = (error: unknown): string => (error instanceof Error ? error
 
 const PRINTABLE = /^[^\u0000-\u001f\u007f-\u009f]+$/;
 const isRate = (rate: unknown): boolean => rate == null || typeof rate === "string";
+/** Optional text that reaches the terminal unescaped, so it must be printable too. */
+const isLabel = (label: unknown): boolean => label == null || (typeof label === "string" && PRINTABLE.test(label));
 
-function isEndpoint(value: unknown): value is Endpoint {
+export function isEndpoint(value: unknown): value is Endpoint {
   if (typeof value !== "object" || value === null) return false;
   const ep = value as Record<string, unknown>;
   const pricing = ep.pricing as Record<string, unknown> | null | undefined;
@@ -370,6 +380,8 @@ function isEndpoint(value: unknown): value is Endpoint {
     PRINTABLE.test(ep.provider_name) &&
     typeof ep.tag === "string" &&
     PRINTABLE.test(ep.tag) &&
+    isLabel(ep.quantization) &&
+    (ep.status == null || Number.isInteger(ep.status)) &&
     Array.isArray(ep.supported_parameters) &&
     ep.supported_parameters.every((p) => typeof p === "string") &&
     typeof pricing === "object" &&
@@ -872,8 +884,8 @@ export async function main(argv: string[]): Promise<number> {
         (options.zdr ? ", ZDR only" : ""),
     );
     console.log(
-      `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties) > turn_s > maxout > $run; ` +
-        `turn_s = ttfb + ${TURN_OUTPUT_TOKENS} tokens at tok/s`,
+      `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties) > turn_s > ttfb > maxout > $run, ` +
+        `price-elim last; turn_s = ttfb + ${TURN_OUTPUT_TOKENS} tokens at tok/s`,
     );
     console.log(
       `# price-elim: $run >${PRICE_ELIM_RATIO}x and >$${PRICE_ELIM_DELTA_USD} more than the cheapest ` +

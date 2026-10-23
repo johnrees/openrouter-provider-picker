@@ -1,8 +1,13 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   type Endpoint,
   fmtRate,
   ineligibleReasons,
+  isEndpoint,
   locationReasons,
   main,
   matchesProvider,
@@ -155,6 +160,19 @@ describe("rank", () => {
     expect(tags([flawless, nearly])).toEqual(["nearly", "flawless"]);
   });
 
+  test("no traffic in 30 minutes is not worse than a measured failure", () => {
+    const idle = ep("idle", { uptime_last_30m: null, latency_last_30m: { p50: 900 } });
+    const failing = ep("failing", { uptime_last_1d: 99, uptime_last_30m: 50, latency_last_30m: { p50: 100 } });
+    expect(tags([failing, idle])).toEqual(["idle", "failing"]);
+  });
+
+  test("without throughput, time to first token decides speed", () => {
+    // Tags sort the other way, so only the TTFB key can put "z-quick" first.
+    const quick = ep("z-quick", { throughput_last_30m: null, latency_last_30m: { p50: 200 } });
+    const slow = ep("a-slow", { throughput_last_30m: null, latency_last_30m: { p50: 800 } });
+    expect(tags([slow, quick])).toEqual(["z-quick", "a-slow"]);
+  });
+
   test("below saturation, the 1-day window outranks the 30-minute one", () => {
     const steadyDay = ep("steady-day", { uptime_last_1d: 99, uptime_last_30m: 90 });
     const goodHalfHour = ep("good-half-hour", {
@@ -248,6 +266,41 @@ describe("secrets", () => {
     expect(resolveAuth({ OPENROUTER_API_KEY: "  k  " })).toEqual({ key: "k", source: "OPENROUTER_API_KEY" });
   });
 
+  test("resolveAuth reads opencode's stored OpenRouter key, and only a key envelope", () => {
+    const dataHome = mkdtempSync(join(tmpdir(), "opp-test-"));
+    try {
+      mkdirSync(join(dataHome, "opencode"));
+      const db = new Database(join(dataHome, "opencode", "opencode.db"));
+      db.run("create table credential (label text, active integer, value text)");
+      const store = (value: string) => {
+        db.run("delete from credential");
+        db.run("insert into credential values ('OpenRouter', 1, ?)", [value]);
+      };
+      store(JSON.stringify({ type: "key", key: " sk-or-v1-stored " }));
+      expect(resolveAuth({ XDG_DATA_HOME: dataHome })).toEqual({
+        key: "sk-or-v1-stored",
+        source: "opencode credential store",
+      });
+      store(JSON.stringify({ type: "oauth", access: "token" }));
+      expect(resolveAuth({ XDG_DATA_HOME: dataHome })).toBeUndefined();
+      store("not json");
+      expect(resolveAuth({ XDG_DATA_HOME: dataHome })).toBeUndefined();
+      db.run("drop table credential");
+      db.close();
+      expect(resolveAuth({ XDG_DATA_HOME: dataHome })).toBeUndefined();
+    } finally {
+      rmSync(dataHome, { recursive: true, force: true });
+    }
+  });
+
+  test("endpoints whose printed fields carry control characters are malformed", () => {
+    expect(isEndpoint(ep("ok"))).toBe(true);
+    expect(isEndpoint(ep("ok", { quantization: "fp8" }))).toBe(true);
+    expect(isEndpoint(ep("ok", { quantization: "fp8\u001b[2J" }))).toBe(false);
+    expect(isEndpoint(ep("ok", { status: "0\u001b[2J" as unknown as number }))).toBe(false);
+    expect(isEndpoint(ep("bad\ntag"))).toBe(false);
+  });
+
   test("resolveAuth finds nothing without a key or credential store", () => {
     expect(resolveAuth({ HOME: "/nonexistent" })).toBeUndefined();
     expect(resolveAuth({})).toBeUndefined();
@@ -314,19 +367,20 @@ describe("end to end against a mocked OpenRouter", () => {
     servedBy: (tag: string) => string | Response | undefined,
     argv = ["m/x", "--verify"],
     zdrList: unknown = ZDR_LIST,
+    { list = endpoints, providers = [] as unknown[] } = {},
   ) {
     const calls: { url: string; init: RequestInit }[] = [];
     const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
     const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input: unknown, init: RequestInit = {}) => {
       const url = String(input);
       calls.push({ url, init });
-      if (url.endsWith("/providers")) return json({ data: [] });
+      if (url.endsWith("/providers")) return json({ data: providers });
       if (url.endsWith("/endpoints/zdr"))
         return zdrList === null ? new Response("down", { status: 503 }) : json(zdrList);
       if (url.endsWith("/models/n/y/endpoints")) return json({ data: { endpoints: endpoints.slice(1) } });
       if (url.endsWith("/endpoints")) {
         await Bun.sleep(10); // m/x answers after n/y, so output order can't follow arrival order
-        return json({ data: { endpoints } });
+        return json({ data: { endpoints: list } });
       }
       const served = servedBy(JSON.parse(String(init.body)).provider.only[0]);
       if (served instanceof Response) return served;
@@ -476,6 +530,26 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(stdout).toBe("");
     expect(stderr).toContain("m/x: no candidate served after 2 probe(s)");
     expect(code).toBe(1);
+  });
+
+  test("-x drops providers by headquarters or datacenter and says why", async () => {
+    const providers = [{ slug: "together", headquarters: "US", datacenters: ["US", "RU"] }];
+    expect((await run(() => undefined, ["m/x", "--pick", "-x", "RU"], ZDR_LIST, { providers })).stdout).toBe(
+      "wafer/us",
+    );
+    const { stdout } = await run(() => undefined, ["m/x", "-x", "RU"], ZDR_LIST, { providers });
+    expect(stdout).toMatch(/together .*datacenter in RU/);
+  });
+
+  test("-p only filters the view: the price guard still compares against every endpoint", async () => {
+    const pricey = ep("pricey", {
+      pricing: { prompt: "0.00001", input_cache_read: "0.000001", completion: "0.00004" },
+    });
+    const list = [ep("cheap"), pricey];
+    const { stdout } = await run(() => undefined, ["m/x", "--json", "-p", "pricey"], ZDR_LIST, { list });
+    const ranked = JSON.parse(stdout).models[0].ranked;
+    expect(ranked.map(({ endpoint }: { endpoint: string }) => endpoint)).toEqual(["pricey"]);
+    expect(ranked[0].priceEliminated).toBe(true);
   });
 
   test("without --zdr, a faster non-ZDR endpoint still wins", async () => {
