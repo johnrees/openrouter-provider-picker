@@ -378,22 +378,27 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(code).toBe(1);
   });
 
-  /** A rate limit that asks for no wait, so the retry is immediate. */
-  const busy = () =>
-    new Response(JSON.stringify({ error: { message: "Provider returned error", code: 429 } }), {
-      status: 429,
+  /** A rate limit or overload that asks for no wait, so the retry is immediate. */
+  const busy = (status = 429) =>
+    new Response(JSON.stringify({ error: { message: "Provider returned error", code: status } }), {
+      status,
       headers: { "Retry-After": "0" },
     });
 
-  test("a probe that is busy once is retried and keeps the pin", async () => {
-    let calls = 0;
-    const { code, output, probes } = await run((tag) => (tag === "together" && calls++ === 0 ? busy() : "Together"));
-    expect(probes.map(({ provider }) => provider.only[0])).toEqual(["together", "together"]);
-    expect(output).toContain("probe together: ok (served by Together, finish=stop, after a retry)");
-    expect(output).toContain("verified pin: m/x:together");
-    expect(output).not.toContain("busy;");
-    expect(code).toBe(0);
-  });
+  test.each([408, 429, 500, 502, 503, 504])(
+    "a probe busy once with HTTP %d is retried and keeps the pin",
+    async (status) => {
+      let calls = 0;
+      const { code, output, probes } = await run((tag) =>
+        tag === "together" && calls++ === 0 ? busy(status) : "Together",
+      );
+      expect(probes.map(({ provider }) => provider.only[0])).toEqual(["together", "together"]);
+      expect(output).toContain("probe together: ok (served by Together, finish=stop, after a retry)");
+      expect(output).toContain("verified pin: m/x:together");
+      expect(output).not.toContain("busy;");
+      expect(code).toBe(0);
+    },
+  );
 
   test("a probe still busy after its retry is reported as busy, not failed", async () => {
     const { code, output, probes } = await run((tag) => (tag === "together" ? busy() : "Wafer"));
