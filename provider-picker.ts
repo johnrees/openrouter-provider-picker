@@ -1,46 +1,45 @@
 #!/usr/bin/env bun
 /**
- * Rank OpenRouter endpoints and print `model:provider` dispatcher pins.
- * Run: bun provider-picker.ts [model/slug ...] [--provider <part> | <part>] [--verify]
- * No model slugs uses the six-model ROSTER; -h/--help prints usage.
- * Provider filters match provider_name case-insensitively: one eligible match
- * prints its pin and full row; multiple matches form a ranked shortlist.
- * No eligible match or a per-model fetch failure sets exit code 1; other models
- * still run. Live ineligible endpoints are listed with their reasons.
+ * provider-picker: rank OpenRouter's serving endpoints for a model and pick
+ * one to pin.
  *
- * --verify walks the ranked eligible candidates per model (filtered first when
- * --provider is given) and makes a real minimal completion request to each
- * `model:provider` pin in order: a provider that errors (no such route,
- * account policy — e.g. zero-retention exclusions enforced at routing time —
- * timeout) or returns an empty completion is excluded, and the next candidate
- * is tried; the first provider that serves a non-empty completion is printed
- * as the VERIFIED PIN. This is the only honest check for account data
- * controls: compliance is enforced at routing time and exposed by no API
- * field. Verification costs ~1 output token per candidate tested.
+ * OpenRouter's default router chooses a provider per request and silently
+ * falls back when one fails. For agentic work that hides what actually ran:
+ * quantization, tool_choice support and chat templates differ by endpoint.
+ * This tool ranks every endpoint of a model under an explicit policy and
+ * prints the request routing that pins the winner with no fallback:
  *
- * Eligible = tools + status 0 (absent = 0) + all four tool_choice modes true.
- * Rank: uptime 1d desc, uptime 30m desc (each >=98% ties as 100%), then
- * latency p50 asc, throughput p50 desc (both nulls last), max completion
- * tokens desc, then prompt, cache-read and completion prices asc as final
- * tiebreakers. Missing or invalid numeric metrics sort last.
- * Within the best eligible tier tied on BOTH uptime windows, a representative
- * run costing BOTH >2x its cheapest member AND >$1 more ranks LAST among
- * all eligible endpoints. Missing prices are unknown, never a cheap baseline.
- * Run cost = (500,000 * prompt + 7,000,000 * cache-read + 30,000 * completion)
- * / 1,000,000, with API per-token rates converted to dollars per million.
- * Price has no other ranking role. Ranking and this guard are computed
- * before provider filtering. Quantization is displayed only.
+ *   "provider": { "only": ["<endpoint tag>"], "allow_fallbacks": false }
+ *
+ * README.md explains the policy. Run with --help for usage.
  */
 
-const PRICE_ELIM_RATIO = 2;
-const PRICE_ELIM_DELTA_USD = 1;
-const UPTIME_SATURATION = 98;
-const TOKENS_PER_MILLION = 1_000_000;
-const REF_PROMPT_TOKENS = 500_000;
-const REF_CACHE_READ_TOKENS = 7_000_000;
-const REF_COMPLETION_TOKENS = 30_000;
-const TOOL_CHOICE_MODES = ["none", "auto", "required", "function"] as const;
-const ROSTER: readonly string[] = [
+import { existsSync } from "node:fs";
+import { parseArgs } from "node:util";
+
+// ---- Policy -----------------------------------------------------------------
+
+/** Uptime at or above this percentage counts as fully up, so 98.5 and 100 tie. */
+export const UPTIME_SATURATION = 98;
+/**
+ * Output tokens in a typical agent turn, used to combine time-to-first-token
+ * and throughput into one speed figure. This is REFERENCE_RUN's completion
+ * tokens spread over roughly 100 turns.
+ */
+export const TURN_OUTPUT_TOKENS = 300;
+/**
+ * An endpoint ranks after all others when its reference run costs more than
+ * this multiple of the cheapest in the most reliable tier...
+ */
+export const PRICE_ELIM_RATIO = 2;
+/** ...and also more than this many dollars extra. Smaller gaps are noise. */
+export const PRICE_ELIM_DELTA_USD = 1;
+/** Token mix of a long agentic session, used to compare prices as one number. */
+export const REFERENCE_RUN = { prompt: 500_000, cacheRead: 7_000_000, completion: 30_000 } as const;
+/** An endpoint missing any of these silently degrades agent loops, so it is ineligible. */
+export const TOOL_CHOICE_MODES = ["none", "auto", "required", "function"] as const;
+/** Models ranked when none are named. */
+export const ROSTER: readonly string[] = [
   "xiaomi/mimo-v2.6-flash",
   "deepseek/deepseek-v4.1-flash-1017",
   "z-ai/glm-5.3",
@@ -49,335 +48,721 @@ const ROSTER: readonly string[] = [
   "qwen/qwen3.8-27b",
 ];
 
+const API = "https://openrouter.ai/api/v1";
+const FETCH_TIMEOUT_MS = 30_000;
+const PROBE_TIMEOUT_MS = 60_000;
+/** Room for a reasoning model to think briefly and still answer. */
+const PROBE_MAX_TOKENS = 256;
+const SLUG = /^[a-z0-9][\w.-]*\/[a-z0-9][\w.:-]*$/i;
+const COUNTRY = /^[A-Z]{2}$/;
+
+const USAGE = `Usage: provider-picker [model/slug ...] [options]
+
+Rank OpenRouter's serving endpoints for each model and pick one to pin.
+
+Arguments:
+  model/slug ...              Models to rank (default: the roster below)
+
+Options:
+  -p, --provider <name>       Keep endpoints whose provider name or tag
+                              contains <name>, case-insensitively. A bare word
+                              without "/" works too: z-ai/glm-5.3 together
+  -x, --exclude-country <CC>  Drop endpoints whose provider is headquartered or
+                              has a datacenter in this ISO country (repeatable
+                              or comma-separated: -x CN,RU). Providers with no
+                              known location are kept and shown with "?".
+      --verify                Send a tiny completion through each candidate's
+                              pin, best first, until one serves (needs a key)
+      --json                  Print machine-readable results
+  -h, --help                  Show this help
+
+Default roster:
+${ROSTER.map((slug) => `  ${slug}`).join("\n")}
+
+Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential.
+Exit status: 0 if every model has a pick, 1 if any has none, 2 on usage errors.`;
+
+// ---- Types ------------------------------------------------------------------
+
+type ToolChoiceMode = (typeof TOOL_CHOICE_MODES)[number];
 type Percentiles = { p50?: number | null; p75?: number | null; p90?: number | null; p99?: number | null };
-type WorkloadPerf = {
-  latency?: Percentiles | null;
-  throughput?: Percentiles | null;
-  request_count?: number | null;
-};
-type Endpoint = {
+
+/** The fields this tool reads from an entry of GET /models/{slug}/endpoints. */
+export type Endpoint = {
   provider_name: string;
-  supported_parameters: string[];
-  supports_tool_choice?: Partial<Record<(typeof TOOL_CHOICE_MODES)[number], unknown>> | null;
+  /** Unique per endpoint, e.g. "baseten/fp4/us". provider_name is not unique. */
+  tag: string;
   status?: number | null;
   quantization?: string | null;
+  max_completion_tokens?: number | null;
+  supported_parameters: string[];
+  supports_tool_choice?: Partial<Record<ToolChoiceMode, unknown>> | null;
   uptime_last_5m?: number | null;
   uptime_last_30m?: number | null;
   uptime_last_1d?: number | null;
-  throughput_last_30m?: Percentiles | null;
+  /** Percentiles are null for anonymous callers. */
   latency_last_30m?: Percentiles | null;
-  perf_last_30m_by_workload?: Record<string, WorkloadPerf> | null;
-  max_completion_tokens?: number | null;
-  pricing: { prompt?: string | null; input_cache_read?: string | null; completion?: string | null };
+  throughput_last_30m?: Percentiles | null;
+  perf_last_30m_by_workload?: { text_generation?: { request_count?: number | null } | null } | null;
+  /** USD per token, as decimal strings. */
+  pricing: { prompt?: string | null; completion?: string | null; input_cache_read?: string | null };
 };
-type Options = { slugs: readonly string[]; provider?: string; verify?: boolean };
-type RankedEndpoint = { endpoint: Endpoint; priceEliminated: boolean };
-type VerifyResult = { provider: string; ok: boolean; detail: string };
 
-const USAGE = `Usage: bun provider-picker.ts [model/slug ...] [--provider <part> | <part>]
+/** Where a provider says it operates, from GET /providers. Either field may be unknown. */
+export type Location = { headquarters?: string | null; datacenters?: string[] | null };
+export type Ranked = { endpoint: Endpoint; cost: number | undefined; priceEliminated: boolean };
+export type Auth = { key: string; source: string };
+type Probe = { endpoint: Endpoint; ok: boolean; detail: string };
+type Verification = { probes: Probe[]; verified?: Endpoint };
+type Report = {
+  slug: string;
+  error?: string;
+  total: number;
+  malformed: number;
+  ranked: Ranked[];
+  ineligible: { endpoint: Endpoint; reasons: string[] }[];
+  verification?: Verification;
+};
+export type Options = {
+  slugs: string[];
+  provider?: string;
+  excludeCountries: string[];
+  verify: boolean;
+  json: boolean;
+  help: boolean;
+};
 
-  No model slugs       Rank the default six-model roster
-  model/slug ...       Rank the specified models
-  --provider <part>    Filter provider names (case-insensitive substring)
-  <part>              Bare provider filter, without a slash
-  -h, --help          Show this help
+// ---- Arguments --------------------------------------------------------------
 
-One eligible filtered match prints model:provider and <== PIN (filtered).
-Multiple matches print a ranked shortlist. No eligible match exits with code 1.`;
-
-function parseArgs(args: string[]): Options {
-  const slugs: string[] = [];
-  let provider: string | undefined;
-  let verify = false;
-  const setProvider = (value: string): void => {
-    if (!value.trim()) throw new Error("provider filter must not be empty");
-    if (provider !== undefined) throw new Error("specify only one provider filter");
-    provider = value.trim();
+export function parseOptions(argv: string[]): Options {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    strict: true,
+    options: {
+      provider: { type: "string", short: "p", multiple: true },
+      "exclude-country": { type: "string", short: "x", multiple: true },
+      verify: { type: "boolean" },
+      json: { type: "boolean" },
+      help: { type: "boolean", short: "h" },
+    },
+  });
+  const slugs = positionals.filter((arg) => arg.includes("/"));
+  const filters = [...(values.provider ?? []), ...positionals.filter((arg) => !arg.includes("/"))];
+  if (filters.length > 1) throw new Error(`give at most one provider filter, got ${filters.join(", ")}`);
+  const provider = filters[0]?.trim();
+  if (provider === "") throw new Error("provider filter must not be empty");
+  const badSlug = slugs.find((slug) => !SLUG.test(slug));
+  if (badSlug !== undefined) throw new Error(`not a model slug: ${badSlug}`);
+  const excludeCountries = (values["exclude-country"] ?? [])
+    .flatMap((list) => list.split(","))
+    .map((code) => code.trim().toUpperCase());
+  const badCountry = excludeCountries.find((code) => !COUNTRY.test(code));
+  if (badCountry !== undefined) throw new Error(`not a two-letter country code: ${JSON.stringify(badCountry)}`);
+  return {
+    slugs: slugs.length ? slugs : [...ROSTER],
+    provider,
+    excludeCountries: [...new Set(excludeCountries)],
+    verify: values.verify ?? false,
+    json: values.json ?? false,
+    help: values.help ?? false,
   };
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
-    if (arg === "--provider") {
-      const value = args[++i];
-      if (value === undefined || value.startsWith("-")) {
-        throw new Error("--provider requires a provider name fragment");
-      }
-      setProvider(value);
-    } else if (arg === "--verify") {
-      if (verify) throw new Error("--verify specified twice");
-      verify = true;
-    } else if (arg.startsWith("-")) {
-      throw new Error(`unknown option: ${arg}`);
-    } else if (arg.includes("/")) {
-      slugs.push(arg);
-    } else {
-      setProvider(arg);
-    }
-  }
-  return { slugs: slugs.length ? slugs : ROSTER, provider, verify };
 }
 
-function missingToolChoice(ep: Endpoint): string[] {
-  return TOOL_CHOICE_MODES.filter((mode) => ep.supports_tool_choice?.[mode] !== true);
-}
+// ---- Eligibility and ranking ------------------------------------------------
 
-function ineligibleReasons(ep: Endpoint): string[] {
+export function ineligibleReasons(ep: Endpoint): string[] {
   const reasons: string[] = [];
+  if ((ep.status ?? 0) !== 0) reasons.push(`status ${ep.status}`);
   if (!ep.supported_parameters.includes("tools")) reasons.push("no native tools");
-  if ((ep.status ?? 0) !== 0) reasons.push(`status=${ep.status}`);
-  const missing = missingToolChoice(ep);
-  if (missing.length) reasons.push(`tool_choice missing ${missing.join("/")}`);
+  const missing = TOOL_CHOICE_MODES.filter((mode) => ep.supports_tool_choice?.[mode] !== true);
+  if (missing.length) reasons.push(`tool_choice lacks ${missing.join("/")}`);
   return reasons;
 }
 
-function price(value: string | null | undefined): number {
-  if (value == null || value.trim() === "") return Infinity;
-  const parsed = Number(value);
-  // OpenRouter endpoint prices are USD/token; all local prices are USD/million.
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed * TOKENS_PER_MILLION : Infinity;
+/** The provider part of an endpoint tag, which is its slug in GET /providers. */
+export const providerSlug = (ep: Endpoint): string => ep.tag.split("/")[0]!.toLowerCase();
+
+/** Why a provider's location rules it out. Unknown locations are never excluded. */
+export function locationReasons(location: Location | undefined, excluded: readonly string[]): string[] {
+  const reasons: string[] = [];
+  const hq = location?.headquarters;
+  if (hq && excluded.includes(hq)) reasons.push(`headquartered in ${hq}`);
+  const datacenters = (location?.datacenters ?? []).filter((code) => excluded.includes(code));
+  if (datacenters.length) reasons.push(`datacenter in ${datacenters.join("/")}`);
+  return reasons;
 }
 
-function runCost(ep: Endpoint): number {
-  return (
-    REF_PROMPT_TOKENS * price(ep.pricing.prompt) +
-    REF_CACHE_READ_TOKENS * price(ep.pricing.input_cache_read) +
-    REF_COMPLETION_TOKENS * price(ep.pricing.completion)
-  ) / TOKENS_PER_MILLION;
+/** A finite, non-negative number, or undefined for anything missing or malformed. */
+const metric = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+
+/** Converts an OpenRouter rate (USD per token, as a string) to USD per million tokens. */
+export function perMillion(rate: string | null | undefined): number | undefined {
+  if (rate == null || rate.trim() === "") return undefined;
+  return metric(Number(rate) * 1_000_000);
 }
 
-// Short agent turns favor median TTFB first; throughput breaks ties for long outputs.
-const p50 = (p?: Percentiles | null): number => finiteNonnegative(p?.p50);
-function finiteNonnegative(value: number | null | undefined): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : Number.NaN;
+/** USD for one REFERENCE_RUN on this endpoint, or undefined when its prices are unknown. */
+export function referenceRunCost(ep: Endpoint): number | undefined {
+  const input = perMillion(ep.pricing.prompt);
+  const output = perMillion(ep.pricing.completion);
+  if (input === undefined || output === undefined) return undefined;
+  // No cache-read price means no cache discount: cached tokens bill as input.
+  const cacheRead = perMillion(ep.pricing.input_cache_read) ?? input;
+  const { prompt, cacheRead: cached, completion } = REFERENCE_RUN;
+  return (prompt * input + cached * cacheRead + completion * output) / 1_000_000;
 }
-// Apply direction before the missing-value sentinel, especially for descending keys.
-const nullsLast = (value: number, descending = false): number =>
-  Number.isNaN(value) ? Infinity : descending ? -value : value;
-const uptime = (value: number | null | undefined): number => {
-  const valid = finiteNonnegative(value);
-  return valid >= UPTIME_SATURATION ? 100 : valid;
+
+/** Estimated milliseconds for a typical agent turn: median TTFB plus TURN_OUTPUT_TOKENS at median speed. */
+export function turnMs(ep: Endpoint): number | undefined {
+  const ttfb = metric(ep.latency_last_30m?.p50);
+  const tps = metric(ep.throughput_last_30m?.p50);
+  if (ttfb === undefined || !tps) return undefined;
+  return ttfb + (TURN_OUTPUT_TOKENS / tps) * 1000;
+}
+
+const uptimeBucket = (value: unknown): number | undefined => {
+  const uptime = metric(value);
+  return uptime !== undefined && uptime >= UPTIME_SATURATION ? 100 : uptime;
 };
-// The 1-day window wins conflicts; 30-minute uptime discriminates only below 98%.
-const uptimeKeys = (ep: Endpoint): readonly number[] => [
-  nullsLast(uptime(ep.uptime_last_1d), true),
-  nullsLast(uptime(ep.uptime_last_30m), true),
+
+// Sort keys ascend. Missing values sort last in either direction.
+const asc = (value: number | undefined): number => value ?? Infinity;
+const desc = (value: number | undefined): number => (value === undefined ? Infinity : -value);
+
+/** The 1-day window outranks the 30-minute one: a clean day beats a clean half hour. */
+const reliabilityKey = (ep: Endpoint): number[] => [
+  desc(uptimeBucket(ep.uptime_last_1d)),
+  desc(uptimeBucket(ep.uptime_last_30m)),
 ];
 
-function rankKey(ep: Endpoint): readonly number[] {
-  return [
-    ...uptimeKeys(ep),
-    nullsLast(p50(ep.latency_last_30m)), // median TTFB ms
-    nullsLast(p50(ep.throughput_last_30m), true), // median tok/s
-    nullsLast(finiteNonnegative(ep.max_completion_tokens), true), // headroom
-    price(ep.pricing.prompt),
-    price(ep.pricing.input_cache_read),
-    price(ep.pricing.completion),
-  ];
+function compareKeys(a: readonly number[], b: readonly number[]): number {
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i]! < b[i]! ? -1 : 1;
+  }
+  return 0;
 }
 
-function rank(endpoints: Endpoint[]): RankedEndpoint[] {
+/** Ranks eligible endpoints best first and drops the ineligible ones. */
+export function rank(endpoints: readonly Endpoint[]): Ranked[] {
   const eligible = endpoints.filter((ep) => ineligibleReasons(ep).length === 0);
   if (!eligible.length) return [];
-  // Use the same saturation buckets as ordering, not raw uptime equality.
-  const bestUp1d = Math.min(...eligible.map((ep) => uptimeKeys(ep)[0]!));
-  const up1dTier = eligible.filter((ep) => uptimeKeys(ep)[0] === bestUp1d);
-  const bestUp30 = Math.min(...up1dTier.map((ep) => uptimeKeys(ep)[1]!));
-  const tier = new Set(up1dTier.filter((ep) => uptimeKeys(ep)[1] === bestUp30));
-  const cheapest = Math.min(...[...tier].map(runCost));
-  return eligible.map((endpoint): RankedEndpoint => {
-    const cost = runCost(endpoint);
-    return {
-      endpoint,
-      priceEliminated: tier.has(endpoint) && Number.isFinite(cheapest) &&
-        cost > cheapest * PRICE_ELIM_RATIO && cost - cheapest > PRICE_ELIM_DELTA_USD,
-    };
-  }).sort((a, b) => {
-    if (a.priceEliminated !== b.priceEliminated) return a.priceEliminated ? 1 : -1;
-    const ka = rankKey(a.endpoint);
-    const kb = rankKey(b.endpoint);
-    for (let i = 0; i < ka.length; i++) {
-      if (ka[i] !== kb[i]) return ka[i]! < kb[i]! ? -1 : 1;
-    }
-    return 0;
-  });
+
+  // Price guard baseline: the cheapest endpoint in the most reliable tier, the
+  // cost of a choice that gives up nothing on uptime. Anything far pricier
+  // ranks after every endpoint that isn't, keeping its order among its peers.
+  const best = eligible.map(reliabilityKey).reduce((a, b) => (compareKeys(a, b) <= 0 ? a : b));
+  const topTierCosts = eligible
+    .filter((ep) => compareKeys(reliabilityKey(ep), best) === 0)
+    .map(referenceRunCost)
+    .filter((cost) => cost !== undefined);
+  const cheapest = Math.min(...topTierCosts);
+
+  const key = ({ endpoint: ep, cost, priceEliminated }: Ranked): number[] => [
+    priceEliminated ? 1 : 0,
+    ...reliabilityKey(ep),
+    asc(turnMs(ep)),
+    asc(metric(ep.latency_last_30m?.p50)), // when throughput is unknown
+    desc(metric(ep.max_completion_tokens)), // output headroom
+    asc(cost), // price only breaks ties
+  ];
+  return eligible
+    .map((endpoint): Ranked => {
+      const cost = referenceRunCost(endpoint);
+      const priceEliminated =
+        cost !== undefined &&
+        Number.isFinite(cheapest) &&
+        cost > cheapest * PRICE_ELIM_RATIO &&
+        cost - cheapest > PRICE_ELIM_DELTA_USD;
+      return { endpoint, cost, priceEliminated };
+    })
+    .sort((a, b) => compareKeys(key(a), key(b)) || a.endpoint.tag.localeCompare(b.endpoint.tag));
 }
 
-// OpenRouter hides latency/throughput percentiles from unauthenticated calls
-// (they come back null). Read the key from the environment, falling back to
-// opencode's own credential store (value is a JSON envelope: {"type":"key",
-// "key":"sk-or-..."}). Capture the subprocess output explicitly; never print it.
-function openrouterKey(): string | undefined {
-  const envKey = process.env.OPENROUTER_API_KEY?.trim();
-  if (envKey) return envKey;
+export function matchesProvider(ep: Endpoint, filter: string): boolean {
+  const needle = filter.toLowerCase();
+  return ep.provider_name.toLowerCase().includes(needle) || ep.tag.toLowerCase().includes(needle);
+}
+
+/**
+ * The `provider` object for a chat request that pins this one endpoint. A
+ * `model:provider` suffix does not do this: OpenRouter ignores it and routes
+ * as usual.
+ */
+export const pinRouting = (ep: Endpoint) => ({ only: [ep.tag], allow_fallbacks: false });
+
+// ---- Auth and output hygiene ------------------------------------------------
+
+/**
+ * Finds an OpenRouter key: OPENROUTER_API_KEY, else opencode's credential
+ * store. Without a key, OpenRouter returns null latency and throughput, so
+ * ranking falls back to uptime, headroom and price. The key is only sent to
+ * openrouter.ai and never printed.
+ */
+export function resolveAuth(env: Record<string, string | undefined> = process.env): Auth | undefined {
+  const fromEnv = env.OPENROUTER_API_KEY?.trim();
+  if (fromEnv) return { key: fromEnv, source: "OPENROUTER_API_KEY" };
+  const dataHome = env.XDG_DATA_HOME || (env.HOME && `${env.HOME}/.local/share`);
+  const db = dataHome && `${dataHome}/opencode/opencode.db`;
+  if (!db || !existsSync(db)) return undefined;
   try {
-    if (!process.env.HOME) return undefined;
-    const db = `${process.env.HOME}/.local/share/opencode/opencode.db`;
-    const proc = Bun.spawnSync(["sqlite3", "-readonly", db, "select value from credential where label='OpenRouter' and active=1 limit 1"], {
-      stdin: "ignore", stdout: "pipe", stderr: "pipe",
-    });
+    const proc = Bun.spawnSync(
+      ["sqlite3", "-readonly", db, "select value from credential where label = 'OpenRouter' and active = 1 limit 1"],
+      { stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 5_000 },
+    );
     if (proc.exitCode !== 0) return undefined;
-    const raw = proc.stdout.toString().trim();
-    if (!raw) return undefined;
-    try {
-      const parsed = JSON.parse(raw) as { type?: string; key?: string };
-      return parsed?.type === "key" && typeof parsed.key === "string"
-        ? parsed.key.trim() || undefined : undefined;
-    } catch {
-      return undefined; // never send a raw non-envelope value
-    }
+    // The stored value is a JSON envelope, {"type":"key","key":"sk-or-..."}.
+    // Anything else is ignored rather than sent as a bearer token.
+    const envelope = JSON.parse(proc.stdout.toString()) as { type?: unknown; key?: unknown } | null;
+    const key = envelope?.type === "key" && typeof envelope.key === "string" ? envelope.key.trim() : "";
+    return key ? { key, source: "opencode credential store" } : undefined;
   } catch {
-    return undefined;
+    return undefined; // no sqlite3, unreadable database, or a value that is not an envelope
   }
 }
 
-async function fetchEndpoints(slug: string, apiKey?: string): Promise<Endpoint[]> {
-  const path = slug.split("/").map(encodeURIComponent).join("/");
-  const res = await fetch(`https://openrouter.ai/api/v1/models/${path}/endpoints`, {
-    signal: AbortSignal.timeout(30_000),
-    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+/**
+ * Makes upstream text safe to print. It scrubs the key and anything shaped
+ * like an OpenRouter key, removes terminal control characters and newlines,
+ * and truncates. Scrubbing runs before truncation so a cut can't hide a key.
+ */
+export function sanitize(text: string, secret?: string, max = 200): string {
+  let out = secret ? text.split(secret).join("[redacted]") : text;
+  out = out
+    .replace(/sk-or-[\w-]+/g, "[redacted]")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return out.length > max ? `${out.slice(0, max - 1)}…` : out;
+}
+
+const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+// ---- OpenRouter -------------------------------------------------------------
+
+const PRINTABLE = /^[^\u0000-\u001f\u007f-\u009f]+$/;
+const isRate = (rate: unknown): boolean => rate == null || typeof rate === "string";
+
+function isEndpoint(value: unknown): value is Endpoint {
+  if (typeof value !== "object" || value === null) return false;
+  const ep = value as Record<string, unknown>;
+  const pricing = ep.pricing as Record<string, unknown> | null | undefined;
+  return (
+    typeof ep.provider_name === "string" &&
+    PRINTABLE.test(ep.provider_name) &&
+    typeof ep.tag === "string" &&
+    PRINTABLE.test(ep.tag) &&
+    Array.isArray(ep.supported_parameters) &&
+    ep.supported_parameters.every((p) => typeof p === "string") &&
+    typeof pricing === "object" &&
+    pricing !== null &&
+    isRate(pricing.prompt) &&
+    isRate(pricing.completion) &&
+    isRate(pricing.input_cache_read)
+  );
+}
+
+/** GET a public OpenRouter path. The key, when given, is sent only here and never to a redirect target. */
+async function getData(path: string, auth?: Auth): Promise<unknown> {
+  const res = await fetch(`${API}${path}`, {
+    headers: auth ? { Authorization: `Bearer ${auth.key}` } : {},
+    redirect: "error",
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-  const body = await res.json() as { data?: { endpoints?: Endpoint[] } } | null;
-  if (!Array.isArray(body?.data?.endpoints)) throw new Error("invalid response: expected data.endpoints array");
-  // Reject malformed required fields before ranking; keep failures per model.
-  for (const ep of body.data.endpoints) {
-    if (!ep || typeof ep.provider_name !== "string" || !ep.provider_name.trim() ||
-        !Array.isArray(ep.supported_parameters) ||
-        !ep.supported_parameters.every((parameter) => typeof parameter === "string") ||
-        !ep.pricing || typeof ep.pricing !== "object" ||
-        ![ep.pricing.prompt, ep.pricing.input_cache_read, ep.pricing.completion]
-          .every((rate) => rate == null || typeof rate === "string")) {
-      throw new Error("invalid response: malformed endpoint");
-    }
+  const body = (await res.json().catch(() => null)) as { data?: unknown; error?: { message?: unknown } } | null;
+  if (!res.ok) {
+    const message = body?.error?.message;
+    throw new Error(`HTTP ${res.status}${message == null ? "" : `: ${String(message)}`}`);
   }
-  return body.data.endpoints;
+  return body?.data;
 }
 
-// --verify probe: one real minimal completion through the model:provider pin.
-// Account data controls (e.g. zero-retention exclusions) are enforced at
-// routing time and exposed by no API field, so a served request is the only
-// honest check. A provider that errors (no such route, policy, timeout) or
-// returns an empty completion is excluded; the walk tries the next
-// candidate in rank order.
-async function probePin(slug: string, provider: string, apiKey: string): Promise<VerifyResult> {
+async function fetchEndpoints(slug: string, auth?: Auth): Promise<{ endpoints: Endpoint[]; malformed: number }> {
+  const path = slug.split("/").map(encodeURIComponent).join("/");
+  const raw = ((await getData(`/models/${path}/endpoints`, auth)) as { endpoints?: unknown } | undefined)?.endpoints;
+  if (!Array.isArray(raw)) throw new Error("unexpected response: no data.endpoints array");
+  const endpoints = raw.filter(isEndpoint);
+  return { endpoints, malformed: raw.length - endpoints.length };
+}
+
+/** Provider locations by slug. Public data, so no key is sent. */
+async function fetchLocations(): Promise<Map<string, Location>> {
+  const raw = await getData("/providers");
+  if (!Array.isArray(raw)) throw new Error("unexpected response: no data array");
+  const code = (value: unknown): string | undefined =>
+    typeof value === "string" && COUNTRY.test(value.toUpperCase()) ? value.toUpperCase() : undefined;
+  const locations = new Map<string, Location>();
+  for (const provider of raw as { slug?: unknown; headquarters?: unknown; datacenters?: unknown }[]) {
+    if (typeof provider?.slug !== "string") continue;
+    locations.set(provider.slug.toLowerCase(), {
+      headquarters: code(provider.headquarters) ?? null,
+      datacenters: Array.isArray(provider.datacenters)
+        ? provider.datacenters.map(code).filter((c) => c !== undefined)
+        : null,
+    });
+  }
+  return locations;
+}
+
+type ChatResponse = {
+  provider?: unknown;
+  error?: { message?: unknown };
+  choices?: { finish_reason?: unknown; message?: { content?: unknown; reasoning?: unknown } }[];
+};
+
+/**
+ * Sends one minimal completion pinned to `ep`. Account data controls, such as
+ * zero-retention or data-collection exclusions, are enforced only at routing
+ * time and appear in no API field. A real request is the only way to learn
+ * whether this account can use an endpoint.
+ */
+async function probe(slug: string, ep: Endpoint, auth: Auth): Promise<Probe> {
+  const result = (ok: boolean, detail: string): Probe => ({ endpoint: ep, ok, detail: sanitize(detail, auth.key) });
   try {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    const res = await fetch(`${API}/chat/completions`, {
       method: "POST",
-      signal: AbortSignal.timeout(60_000),
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${auth.key}`, "Content-Type": "application/json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       body: JSON.stringify({
-        model: `${slug}:${provider}`,
-        messages: [{ role: "user", content: "Reply with exactly: ROUTED-OK" }],
-        // Reasoning models burn tokens on thinking before any text; a tiny
-        // budget would surface as finish=length with empty content and
-        // wrongly exclude a serving provider (witnessed on minimax).
-        max_tokens: 128,
+        model: slug,
+        provider: pinRouting(ep),
+        max_tokens: PROBE_MAX_TOKENS,
+        messages: [{ role: "user", content: "Reply with exactly: OK" }],
       }),
     });
-    const body = await res.json().catch(() => null) as
-      | { choices?: { message?: { content?: unknown }; finish_reason?: unknown }[]; error?: { message?: unknown } }
-      | null;
-    let detail = `HTTP ${res.status} ${res.statusText}`.trim();
-    if (body?.error?.message != null) detail += ` ${String(body.error.message).slice(0, 160)}`;
-    if (!res.ok) return { provider, ok: false, detail };
+    const body = (await res.json().catch(() => null)) as ChatResponse | null;
+    const upstream = body?.error?.message;
+    if (!res.ok || upstream != null) {
+      return result(false, `HTTP ${res.status}${upstream == null ? "" : ` ${String(upstream)}`}`);
+    }
+    // Pinning makes this unreachable unless OpenRouter changes semantics. Check anyway, since verifying is the point.
+    const servedBy = typeof body?.provider === "string" ? body.provider : "an unknown provider";
+    if (servedBy.toLowerCase() !== ep.provider_name.toLowerCase()) return result(false, `served by ${servedBy}`);
     const choice = body?.choices?.[0];
-    const text = typeof choice?.message?.content === "string" ? choice.message.content : "";
-    const finish = typeof choice?.finish_reason === "string" ? choice.finish_reason : "?";
-    if (text.trim()) return { provider, ok: true, detail: `non-empty completion (finish=${finish})` };
-    return { provider, ok: false, detail: `empty completion (finish=${finish})` };
+    const finish = String(choice?.finish_reason ?? "none");
+    const said = [choice?.message?.content, choice?.message?.reasoning].some(
+      (text) => typeof text === "string" && text.trim() !== "",
+    );
+    return said
+      ? result(true, `served by ${servedBy}, finish=${finish}`)
+      : result(false, `empty completion, finish=${finish}`);
   } catch (error) {
-    return { provider, ok: false, detail: error instanceof Error ? error.message : String(error) };
+    return result(false, errorMessage(error));
   }
 }
 
-function row(ep: Endpoint): string {
-  const rate = (value: string | null | undefined): string => {
-    const parsed = price(value);
-    return Number.isFinite(parsed) ? Number(parsed.toPrecision(12)).toString() : "-";
+/** Probes candidates in rank order and stops at the first that serves. */
+async function verify(slug: string, candidates: readonly Ranked[], auth: Auth): Promise<Verification> {
+  const probes: Probe[] = [];
+  for (const { endpoint } of candidates) {
+    const outcome = await probe(slug, endpoint, auth);
+    probes.push(outcome);
+    if (outcome.ok) return { probes, verified: endpoint };
+  }
+  return { probes };
+}
+
+type Context = { options: Options; auth?: Auth; locations?: Map<string, Location> };
+
+const locationOf = (ep: Endpoint, { locations }: Context): Location | undefined => locations?.get(providerSlug(ep));
+
+async function buildReport(slug: string, ctx: Context): Promise<Report> {
+  const { options, auth } = ctx;
+  try {
+    const { endpoints, malformed } = await fetchEndpoints(slug, auth);
+    const excludedBy = (ep: Endpoint) => locationReasons(locationOf(ep, ctx), options.excludeCountries);
+    const kept = (ep: Endpoint) => options.provider === undefined || matchesProvider(ep, options.provider);
+    // Excluded countries are a hard constraint, so they leave before ranking and
+    // can't set the price guard's baseline. The provider filter is only a view:
+    // it applies after ranking so the guard still compares against the whole tier.
+    const ranked = rank(endpoints.filter((ep) => !excludedBy(ep).length)).filter(({ endpoint }) => kept(endpoint));
+    const ineligible = endpoints
+      .filter(kept)
+      .map((endpoint) => ({ endpoint, reasons: [...ineligibleReasons(endpoint), ...excludedBy(endpoint)] }))
+      .filter(({ reasons }) => reasons.length);
+    const verification = options.verify && auth && ranked.length ? await verify(slug, ranked, auth) : undefined;
+    return { slug, total: endpoints.length, malformed, ranked, ineligible, verification };
+  } catch (error) {
+    return {
+      slug,
+      error: sanitize(errorMessage(error), auth?.key),
+      total: 0,
+      malformed: 0,
+      ranked: [],
+      ineligible: [],
+    };
+  }
+}
+
+const pickOf = (report: Report): Endpoint | undefined =>
+  report.verification ? report.verification.verified : report.ranked[0]?.endpoint;
+
+// ---- Rendering --------------------------------------------------------------
+
+const dash = (value: string | undefined): string => value ?? "-";
+const fmtPct = (value: unknown): string => dash(metric(value)?.toFixed(1).replace(/\.0$/, ""));
+const fmtInt = (value: unknown): string => dash(metric(value)?.toFixed(0));
+const fmtSeconds = (ms: number | undefined): string => dash(ms === undefined ? undefined : (ms / 1000).toFixed(1));
+/** Three significant figures without trailing zeros or exponent notation: 100, 1.4, 0.079, 1230. */
+export const fmtRate = (rate: string | null | undefined): string => {
+  const usd = perMillion(rate);
+  return usd === undefined ? "-" : String(Number(usd.toPrecision(3)));
+};
+const fmtCount = (value: unknown): string => {
+  const n = metric(value);
+  if (n === undefined) return "-";
+  if (n >= 999_500) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (n >= 10_000) return `${Math.round(n / 1_000)}k`;
+  return n.toFixed(0);
+};
+const yesNo = (ep: Endpoint, parameter: string): string => (ep.supported_parameters.includes(parameter) ? "Y" : "-");
+const fmtWhere = (location: Location | undefined): [string, string] => [
+  location?.headquarters ?? "?",
+  location?.datacenters?.length ? location.datacenters.join(",") : "?",
+];
+
+/** Pads cells into columns. Text columns align left, numeric columns align right. */
+function table(header: string[], rows: string[][], numeric: ReadonlySet<number>, indent = "  "): string[] {
+  const widths = header.map((h, col) => Math.max(h.length, ...rows.map((row) => row[col]!.length)));
+  return [header, ...rows].map(
+    (row) =>
+      indent +
+      row
+        .map((cell, col) => (numeric.has(col) ? cell.padStart(widths[col]!) : cell.padEnd(widths[col]!)))
+        .join("  ")
+        .trimEnd(),
+  );
+}
+
+function renderReport(report: Report, ctx: Context): string {
+  const { options } = ctx;
+  const filter = options.provider === undefined ? "" : ` · provider ~ ${JSON.stringify(options.provider)}`;
+  if (report.error) return `\n## ${report.slug}${filter}\n  fetch failed: ${report.error}`;
+
+  const count =
+    options.provider === undefined
+      ? `${report.total - report.ineligible.length} of ${report.total}`
+      : String(report.ranked.length);
+  const lines = [`\n## ${report.slug}${filter} · ${count} eligible`];
+  if (report.malformed)
+    lines.push(`  (skipped ${report.malformed} malformed endpoint${report.malformed === 1 ? "" : "s"})`);
+  const pick = pickOf(report);
+
+  if (report.ranked.length) {
+    const header = [
+      "",
+      "#",
+      "endpoint",
+      "quant",
+      "hq",
+      "dc",
+      "up1d",
+      "up30m",
+      "up5m",
+      "turn_s",
+      "ttfb",
+      "tok/s",
+      "reqs",
+      "maxout",
+      "$in",
+      "$cache",
+      "$out",
+      "$run",
+      "so",
+      "rsn",
+      "eff",
+      "note",
+    ];
+    const rows = report.ranked.map(({ endpoint: ep, cost, priceEliminated }, i) => [
+      ep === pick ? "▶" : "",
+      String(i + 1),
+      ep.tag,
+      ep.quantization && ep.quantization !== "unknown" ? ep.quantization : "?",
+      ...fmtWhere(locationOf(ep, ctx)),
+      fmtPct(ep.uptime_last_1d),
+      fmtPct(ep.uptime_last_30m),
+      fmtPct(ep.uptime_last_5m),
+      fmtSeconds(turnMs(ep)),
+      fmtInt(ep.latency_last_30m?.p50),
+      fmtInt(ep.throughput_last_30m?.p50),
+      fmtCount(ep.perf_last_30m_by_workload?.text_generation?.request_count),
+      fmtCount(ep.max_completion_tokens),
+      fmtRate(ep.pricing.prompt),
+      fmtRate(ep.pricing.input_cache_read),
+      fmtRate(ep.pricing.completion),
+      cost === undefined ? "-" : cost.toFixed(2),
+      yesNo(ep, "structured_outputs"),
+      yesNo(ep, "reasoning"),
+      yesNo(ep, "reasoning_effort"),
+      priceEliminated ? "price-elim" : "",
+    ]);
+    lines.push(...table(header, rows, new Set([1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])));
+  } else {
+    lines.push(`  no eligible endpoint${options.provider === undefined ? "" : " matches"}`);
+  }
+
+  for (const { endpoint, ok, detail } of report.verification?.probes ?? []) {
+    lines.push(`  probe ${endpoint.tag}: ${ok ? "ok" : "FAILED"} (${detail})`);
+  }
+  if (pick) {
+    lines.push(
+      `  ${report.verification ? "verified pin" : "pin"}: ${report.slug}:${pick.tag}`,
+      `  routing: "provider": ${JSON.stringify(pinRouting(pick))}`,
+    );
+  } else if (report.verification) {
+    lines.push(`  no candidate served after ${report.verification.probes.length} probe(s)`);
+  }
+
+  if (report.ineligible.length) {
+    lines.push(`  ineligible:`);
+    const width = Math.max(...report.ineligible.map(({ endpoint }) => endpoint.tag.length));
+    for (const { endpoint, reasons } of report.ineligible)
+      lines.push(`    ${endpoint.tag.padEnd(width)}  ${reasons.join("; ")}`);
+  }
+  return lines.join("\n");
+}
+
+function reportJson(report: Report, ctx: Context) {
+  const pick = pickOf(report);
+  return {
+    model: report.slug,
+    ...(report.error === undefined ? {} : { error: report.error }),
+    pick: pick
+      ? {
+          pin: `${report.slug}:${pick.tag}`,
+          endpoint: pick.tag,
+          provider: pick.provider_name,
+          routing: pinRouting(pick),
+          verified: report.verification !== undefined,
+        }
+      : null,
+    ranked: report.ranked.map(({ endpoint: ep, cost, priceEliminated }, i) => {
+      const location = locationOf(ep, ctx);
+      return {
+        rank: i + 1,
+        endpoint: ep.tag,
+        provider: ep.provider_name,
+        quantization: ep.quantization ?? null,
+        headquarters: location?.headquarters ?? null,
+        datacenters: location?.datacenters ?? null,
+        uptime: {
+          last1d: metric(ep.uptime_last_1d) ?? null,
+          last30m: metric(ep.uptime_last_30m) ?? null,
+          last5m: metric(ep.uptime_last_5m) ?? null,
+        },
+        turnMs: turnMs(ep) ?? null,
+        ttfbMsP50: metric(ep.latency_last_30m?.p50) ?? null,
+        tokensPerSecondP50: metric(ep.throughput_last_30m?.p50) ?? null,
+        requests30m: metric(ep.perf_last_30m_by_workload?.text_generation?.request_count) ?? null,
+        maxCompletionTokens: metric(ep.max_completion_tokens) ?? null,
+        usdPerMillion: {
+          input: perMillion(ep.pricing.prompt) ?? null,
+          cacheRead: perMillion(ep.pricing.input_cache_read) ?? null,
+          output: perMillion(ep.pricing.completion) ?? null,
+        },
+        referenceRunUsd: cost ?? null,
+        priceEliminated,
+        structuredOutputs: ep.supported_parameters.includes("structured_outputs"),
+        reasoning: ep.supported_parameters.includes("reasoning"),
+        reasoningEffort: ep.supported_parameters.includes("reasoning_effort"),
+      };
+    }),
+    ineligible: report.ineligible.map(({ endpoint, reasons }) => ({
+      endpoint: endpoint.tag,
+      provider: endpoint.provider_name,
+      reasons,
+    })),
+    ...(report.verification && {
+      probes: report.verification.probes.map(({ endpoint, ok, detail }) => ({ endpoint: endpoint.tag, ok, detail })),
+    }),
   };
-  const up = (value: number | null | undefined): string =>
-    Number.isNaN(finiteNonnegative(value)) ? "-" : value!.toFixed(2);
-  const has = (parameter: string): string => ep.supported_parameters.includes(parameter) ? "Y" : "N";
-  const missing = missingToolChoice(ep);
-  const tc = missing.length ? `partial(${missing.join("/")})` : "full";
-  const ttfb = p50(ep.latency_last_30m);
-  const tps = p50(ep.throughput_last_30m);
-  const gen = ep.perf_last_30m_by_workload?.text_generation;
-  const reqs = gen?.request_count ?? "-";
-  return `${ep.provider_name.padEnd(14)} tools=${has("tools")} tc=${tc.padEnd(21)} so=${has("structured_outputs")} re=${has("reasoning")} reff=${has("reasoning_effort")} q=${ep.quantization ?? "-"} up5m=${up(ep.uptime_last_5m)} up30=${up(ep.uptime_last_30m)} up1d=${up(ep.uptime_last_1d)} tps=${Number.isNaN(tps) ? "-" : tps} ttfb_ms=${Number.isNaN(ttfb) ? "-" : ttfb} reqs30m=${reqs} maxout=${ep.max_completion_tokens ?? "-"} $in/m=${rate(ep.pricing.prompt)} $cr/m=${rate(ep.pricing.input_cache_read)} $out/m=${rate(ep.pricing.completion)}`;
 }
 
-async function main(): Promise<void> {
-  const args = Bun.argv.slice(2);
-  if (args.includes("-h") || args.includes("--help")) {
-    console.log(USAGE);
-    return;
-  }
+// ---- Main -------------------------------------------------------------------
+
+export async function main(argv: string[]): Promise<number> {
   let options: Options;
   try {
-    options = parseArgs(args);
+    options = parseOptions(argv);
   } catch (error) {
-    console.error(`${error instanceof Error ? error.message : String(error)}\n\n${USAGE}`);
-    process.exitCode = 1;
-    return;
+    console.error(`provider-picker: ${errorMessage(error)}\n\n${USAGE}`);
+    return 2;
   }
-  const filter = options.provider?.toLowerCase();
-  const apiKey = openrouterKey();
-  console.log(`# provider pin ranking — ${new Date().toISOString()}`);
-  console.log(`# policy: uptime 1d desc, uptime 30m desc (each >=${UPTIME_SATURATION}% ties as 100%); TTFB p50 asc, throughput p50 desc, maxout desc (missing last); prompt/cache-read/completion price asc final tiebreakers; best uptime tier: BOTH >${PRICE_ELIM_RATIO}x cheapest AND >$${PRICE_ELIM_DELTA_USD.toFixed(2)} extra per REF run ranks last; REF=500k prompt+7m cache-read+30k completion; prices USD/million; unknown prices never a cheap baseline; rank before filtering; q display-only`);
-  console.log(`# auth: ${apiKey ? "authenticated (latency/throughput visible)" : "ANONYMOUS (latency/throughput null — set OPENROUTER_API_KEY)"}`);
-  for (const slug of options.slugs) {
-    console.log(`\n## ${slug}${options.provider === undefined ? "" : ` — provider contains ${JSON.stringify(options.provider)}`}`);
-    try {
-      const endpoints = await fetchEndpoints(slug, apiKey);
-      const matches = (ep: Endpoint): boolean => filter === undefined || ep.provider_name.toLowerCase().includes(filter);
-      const sorted = rank(endpoints).filter(({ endpoint }) => matches(endpoint));
-      if (!sorted.length) {
-        console.log(`  no eligible provider${filter === undefined ? "" : ` matching ${JSON.stringify(options.provider)}`} (tools + full tool_choice + status 0)`);
-        process.exitCode = 1;
-      } else if (filter !== undefined && sorted.length === 1) {
-        console.log(`  PIN: ${slug}:${sorted[0]!.endpoint.provider_name}`);
-      } else if (filter !== undefined) {
-        console.log(`  shortlist: ${sorted.length} eligible providers`);
-      }
-      sorted.forEach(({ endpoint, priceEliminated }, i) => {
-        const pin = filter === undefined ? (i === 0 ? "  <== PIN" : "")
-          : sorted.length === 1 ? "  <== PIN (filtered)" : "";
-        console.log(`  ${row(endpoint)}${pin}${priceEliminated ? " PRICE-ELIMINATED" : ""}`);
-      });
-      for (const ep of endpoints) {
-        if (!matches(ep) || (ep.status ?? 0) !== 0) continue;
-        const reasons = ineligibleReasons(ep);
-        if (reasons.length) console.log(`  (ineligible, ${reasons.join("; ")}: ${ep.provider_name})`);
-      }
-      if (options.verify && sorted.length) {
-        if (!apiKey) {
-          console.log("  --verify requires an API key (OPENROUTER_API_KEY or the opencode credential store)");
-          process.exitCode = 1;
-        } else {
-          let served: VerifyResult | undefined;
-          let probes = 0;
-          for (const { endpoint } of sorted) {
-            const r = await probePin(slug, endpoint.provider_name, apiKey);
-            probes++;
-            console.log(`  probe ${slug}:${r.provider} — ${r.ok ? "SERVED" : `EXCLUDED (${r.detail})`}`);
-            if (r.ok) {
-              served = r;
-              break;
-            }
-          }
-          if (served) {
-            console.log(`  VERIFIED PIN: ${slug}:${served.provider} (${probes} probe${probes === 1 ? "" : "s"}, ${served.detail})`);
-          } else {
-            console.log(`  no serving candidate after ${probes} probe${probes === 1 ? "" : "s"}`);
-            process.exitCode = 1;
-          }
-        }
-      }
-    } catch (error) {
-      console.log(`  fetch failed: ${error instanceof Error ? error.message : String(error)}`);
-      process.exitCode = 1;
+  if (options.help) {
+    console.log(USAGE);
+    return 0;
+  }
+
+  const auth = resolveAuth();
+  if (options.verify && !auth) {
+    console.error("provider-picker: --verify sends real requests and needs an API key; set OPENROUTER_API_KEY");
+    return 2;
+  }
+  if (!auth) {
+    console.error(
+      "provider-picker: no API key found. OpenRouter hides latency and throughput from anonymous callers, " +
+        "so speed is not ranked. Set OPENROUTER_API_KEY.",
+    );
+  }
+
+  let locations: Map<string, Location> | undefined;
+  try {
+    locations = await fetchLocations();
+  } catch (error) {
+    const why = sanitize(errorMessage(error));
+    if (options.excludeCountries.length) {
+      console.error(`provider-picker: cannot apply --exclude-country without provider locations (${why})`);
+      return 1;
+    }
+    console.error(`provider-picker: provider locations unavailable (${why})`);
+  }
+
+  // Fetch every model concurrently, but print in argument order.
+  const ctx: Context = { options, auth, locations };
+  const pending = options.slugs.map((slug) => buildReport(slug, ctx));
+  let ok = true;
+  if (options.json) {
+    const reports = await Promise.all(pending);
+    ok = reports.every((report) => pickOf(report) !== undefined);
+    console.log(
+      JSON.stringify(
+        {
+          generatedAt: new Date().toISOString(),
+          authenticated: auth !== undefined,
+          excludeCountries: options.excludeCountries,
+          models: reports.map((report) => reportJson(report, ctx)),
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    console.log(`# OpenRouter endpoint ranking · ${new Date().toISOString()} · auth: ${auth?.source ?? "anonymous"}`);
+    console.log(
+      `# eligible: native tools, status 0, tool_choice ${TOOL_CHOICE_MODES.join("/")}` +
+        (options.excludeCountries.length ? `, not in ${options.excludeCountries.join("/")}` : ""),
+    );
+    console.log(
+      `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties) > turn_s > maxout > $run; ` +
+        `turn_s = ttfb + ${TURN_OUTPUT_TOKENS} tokens at tok/s`,
+    );
+    console.log(
+      `# price-elim: $run >${PRICE_ELIM_RATIO}x and >$${PRICE_ELIM_DELTA_USD} more than the cheapest ` +
+        `top-uptime endpoint; ranks after all others`,
+    );
+    console.log(
+      `# prices: USD per million tokens; $run = ${REFERENCE_RUN.prompt / 1000}k in + ` +
+        `${REFERENCE_RUN.cacheRead / 1_000_000}M cache read + ${REFERENCE_RUN.completion / 1000}k out`,
+    );
+    for (const next of pending) {
+      const report = await next;
+      ok &&= pickOf(report) !== undefined;
+      console.log(renderReport(report, ctx));
     }
   }
+  return ok ? 0 : 1;
 }
 
-await main();
+if (import.meta.main) process.exitCode = await main(Bun.argv.slice(2));
