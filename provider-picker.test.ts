@@ -12,11 +12,12 @@ import {
   rank,
   referenceRunCost,
   resolveAuth,
+  retryDelay,
   sanitize,
   turnMs,
 } from "./provider-picker.ts";
 
-/** An eligible, fully up endpoint: $1/M in, $0.1/M cache read, $4/M out ($1.32 per reference run). */
+/** An eligible, fully up endpoint: $1/M in, $0.1/M cache read, $4/M out ($2.12 per reference run). */
 function ep(tag: string, overrides: Partial<Endpoint> = {}): Endpoint {
   return {
     provider_name: tag.split("/")[0]!,
@@ -296,7 +297,6 @@ describe("end to end against a mocked OpenRouter", () => {
     ep("broken", { status: -2 }), // ZDR but ineligible: never ranked or probed
   ];
 
-  /** Runs main against a fake OpenRouter whose router serves `servedBy(tag)` for each pinned probe. */
   /** OpenRouter's ZDR list for the mock: only wafer/us is zero-data-retention. null makes the lookup fail. */
   const ZDR_LIST = {
     data: [
@@ -306,8 +306,12 @@ describe("end to end against a mocked OpenRouter", () => {
     ],
   };
 
+  /**
+   * Runs main against a fake OpenRouter whose router answers each pinned probe
+   * as `servedBy(tag)`: a provider name, a raw Response, or no provider.
+   */
   async function run(
-    servedBy: (tag: string) => string | undefined,
+    servedBy: (tag: string) => string | Response | undefined,
     argv = ["m/x", "--verify"],
     zdrList: unknown = ZDR_LIST,
   ) {
@@ -325,6 +329,7 @@ describe("end to end against a mocked OpenRouter", () => {
         return json({ data: { endpoints } });
       }
       const served = servedBy(JSON.parse(String(init.body)).provider.only[0]);
+      if (served instanceof Response) return served;
       return json({
         ...(served && { provider: served }),
         choices: [{ finish_reason: "stop", message: { content: "OK" } }],
@@ -371,6 +376,69 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(output).toContain("no candidate served after 2 probe(s)");
     expect(output).not.toContain("verified pin");
     expect(code).toBe(1);
+  });
+
+  /** A rate limit or overload that asks for no wait, so the retry is immediate. */
+  const busy = (status = 429) =>
+    new Response(JSON.stringify({ error: { message: "Provider returned error", code: status } }), {
+      status,
+      headers: { "Retry-After": "0" },
+    });
+
+  test.each([408, 429, 500, 502, 503, 504])(
+    "a probe busy once with HTTP %d is retried and keeps the pin",
+    async (status) => {
+      let calls = 0;
+      const { code, output, probes } = await run((tag) =>
+        tag === "together" && calls++ === 0 ? busy(status) : "Together",
+      );
+      expect(probes.map(({ provider }) => provider.only[0])).toEqual(["together", "together"]);
+      expect(output).toContain("probe together: ok (served by Together, finish=stop, after a retry)");
+      expect(output).toContain("verified pin: m/x:together");
+      expect(output).not.toContain("busy;");
+      expect(code).toBe(0);
+    },
+  );
+
+  test("a probe still busy after its retry is reported as busy, not failed", async () => {
+    const { code, output, probes } = await run((tag) => (tag === "together" ? busy() : "Wafer"));
+    expect(probes.map(({ provider }) => provider.only[0])).toEqual(["together", "together", "wafer/us"]);
+    expect(output).toContain("probe together: busy (HTTP 429 Provider returned error, retried)");
+    expect(output).toContain("verified pin: m/x:wafer/us");
+    expect(output).toContain("note: together was busy; re-run to retry");
+    expect(code).toBe(0);
+  });
+
+  test("a rate limit reported in a 200 body is busy too", async () => {
+    const limited = () => new Response(JSON.stringify({ error: { message: "Rate limited", code: 429 } }));
+    const { output } = await run((tag) => (tag === "together" ? limited() : "Wafer"));
+    expect(output).toContain("probe together: busy (HTTP 429 Rate limited, retried)");
+  });
+
+  test("a hard failure is not retried", async () => {
+    const gone = () => new Response(JSON.stringify({ error: { message: "No allowed providers" } }), { status: 404 });
+    const { output, probes } = await run((tag) => (tag === "together" ? gone() : "Wafer"));
+    expect(probes.map(({ provider }) => provider.only[0])).toEqual(["together", "wafer/us"]);
+    expect(output).toContain("probe together: FAILED (HTTP 404 No allowed providers)");
+    expect(output).not.toContain("busy");
+  });
+
+  test("--pick names skipped busy endpoints on stderr; --json marks them", async () => {
+    const picked = await run((tag) => (tag === "together" ? busy() : "Wafer"), ["m/x", "--pick", "--verify"]);
+    expect(picked.stdout).toBe("wafer/us");
+    expect(picked.stderr).toContain("m/x: picked wafer/us, but together was busy; re-run to retry");
+    const { stdout } = await run(() => busy(), ["m/x", "--json", "--verify"]);
+    const probes = JSON.parse(stdout).models[0].probes;
+    expect(probes.map(({ busy }: { busy: boolean }) => busy)).toEqual([true, true]);
+  });
+
+  test("Retry-After sets the retry wait, capped, with a default when absent or a date", () => {
+    expect(retryDelay("0")).toBe(0);
+    expect(retryDelay("3")).toBe(3_000);
+    expect(retryDelay("120")).toBe(10_000);
+    expect(retryDelay(null)).toBe(2_000);
+    expect(retryDelay("")).toBe(2_000);
+    expect(retryDelay("Wed, 21 Oct 2026 07:28:00 GMT")).toBe(2_000);
   });
 
   test("the key goes only where it is needed and is never printed", async () => {
