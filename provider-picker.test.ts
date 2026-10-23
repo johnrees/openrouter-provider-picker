@@ -293,6 +293,7 @@ describe("end to end against a mocked OpenRouter", () => {
   const endpoints = [
     ep("together", { provider_name: "Together" }),
     ep("wafer/us", { provider_name: "Wafer", latency_last_30m: { p50: 900 } }),
+    ep("broken", { status: -2 }), // ZDR but ineligible: never ranked or probed
   ];
 
   /** Runs main against a fake OpenRouter whose router serves `servedBy(tag)` for each pinned probe. */
@@ -300,6 +301,7 @@ describe("end to end against a mocked OpenRouter", () => {
   const ZDR_LIST = {
     data: [
       { model_id: "m/x", tag: "wafer/us" },
+      { model_id: "m/x", tag: "broken" },
       { model_id: "n/y", tag: "wafer/us" },
     ],
   };
@@ -416,7 +418,7 @@ describe("end to end against a mocked OpenRouter", () => {
   test("--zdr keeps only ZDR endpoints and lists the rest as ineligible", async () => {
     expect((await run(() => undefined, ["m/x", "--pick", "--zdr"])).stdout).toBe("wafer/us");
     const { stdout } = await run(() => undefined, ["m/x", "--zdr"]);
-    expect(stdout).toMatch(/together +not ZDR/);
+    expect(stdout).toMatch(/together +zdr - +not ZDR/);
     expect(stdout).toContain("ZDR only");
   });
 
@@ -453,5 +455,14 @@ describe("end to end against a mocked OpenRouter", () => {
       together: false,
       "wafer/us": true,
     });
+  });
+
+  test("ineligible endpoints show their ZDR status too", async () => {
+    const text = await run(() => undefined, ["m/x"]);
+    expect(text.stdout).toMatch(/broken +zdr Y +status -2/);
+    const { models } = JSON.parse((await run(() => undefined, ["m/x", "--json"])).stdout);
+    expect(models[0].ineligible).toEqual([
+      { endpoint: "broken", provider: "broken", zdr: true, reasons: ["status -2"] },
+    ]);
   });
 });

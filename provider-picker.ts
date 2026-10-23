@@ -654,8 +654,10 @@ function renderReport(report: Report, ctx: Context): string {
   if (report.ineligible.length) {
     lines.push(`  ineligible:`);
     const width = Math.max(...report.ineligible.map(({ endpoint }) => endpoint.tag.length));
-    for (const { endpoint, reasons } of report.ineligible)
-      lines.push(`    ${endpoint.tag.padEnd(width)}  ${reasons.join("; ")}`);
+    for (const { endpoint, reasons } of report.ineligible) {
+      const zdr = fmtZdr(zdrOf(endpoint, report.slug, ctx));
+      lines.push(`    ${endpoint.tag.padEnd(width)}  zdr ${zdr}  ${reasons.join("; ")}`);
+    }
   }
   return lines.join("\n");
 }
@@ -709,6 +711,7 @@ function reportJson(report: Report, ctx: Context) {
     ineligible: report.ineligible.map(({ endpoint, reasons }) => ({
       endpoint: endpoint.tag,
       provider: endpoint.provider_name,
+      zdr: zdrOf(endpoint, report.slug, ctx) ?? null,
       reasons,
     })),
     ...(report.verification && {
