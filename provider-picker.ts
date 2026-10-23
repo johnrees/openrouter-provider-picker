@@ -34,8 +34,12 @@ export const TURN_OUTPUT_TOKENS = 300;
 export const PRICE_ELIM_RATIO = 2;
 /** ...and also more than this many dollars extra. Smaller gaps are noise. */
 export const PRICE_ELIM_DELTA_USD = 1;
-/** Token mix of a long agentic session, used to compare prices as one number. */
-export const REFERENCE_RUN = { prompt: 500_000, cacheRead: 7_000_000, completion: 30_000 } as const;
+/**
+ * Token mix of a long agentic session, used to compare prices as one number.
+ * Agent loops resend their context, so cache reads dominate: measured sessions
+ * read 6M to 29M cached tokens against 0.1M to 2M fresh.
+ */
+export const REFERENCE_RUN = { prompt: 500_000, cacheRead: 15_000_000, completion: 30_000 } as const;
 /** An endpoint missing any of these silently degrades agent loops, so it is ineligible. */
 export const TOOL_CHOICE_MODES = ["none", "auto", "required", "function"] as const;
 

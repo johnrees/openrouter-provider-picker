@@ -119,13 +119,13 @@ describe("prices", () => {
     for (const bad of [undefined, null, "", " ", "abc", "-1"]) expect(perMillion(bad)).toBeUndefined();
   });
 
-  test("reference run is 500k in + 7M cache read + 30k out", () => {
-    expect(referenceRunCost(ep("a"))).toBeCloseTo(0.5 + 0.7 + 0.12);
+  test("reference run is 500k in + 15M cache read + 30k out", () => {
+    expect(referenceRunCost(ep("a"))).toBeCloseTo(0.5 + 1.5 + 0.12);
   });
 
   test("without a cache-read price, cached tokens bill at the input rate", () => {
     const noCache = ep("a", { pricing: { prompt: "0.000001", completion: "0.000004" } });
-    expect(referenceRunCost(noCache)).toBeCloseTo(0.5 + 7 + 0.12);
+    expect(referenceRunCost(noCache)).toBeCloseTo(0.5 + 15 + 0.12);
   });
 
   test("display keeps integer zeros and avoids exponents", () => {
