@@ -606,6 +606,27 @@ describe("end to end against a mocked OpenRouter", () => {
       const { stdout } = await run(() => undefined, ["m/x", "--zdr"], zdrList, { list });
       expect(stdout).toContain(`routing: "provider": ${JSON.stringify(pinned)}`);
     });
+
+    test("a tier endpoint served at its own tier passes", async () => {
+      const fast = ep("fireworks/fast", { service_tier: "priority", latency_last_30m: { p50: 50 } });
+      const { output, probes } = await run(() => reply("priority"), undefined, ZDR_LIST, {
+        list: [list[0]!, list[1]!, fast],
+      });
+      expect(probes.map(({ provider }) => provider.only[0])).toEqual(["fireworks/fast"]);
+      expect(output).toContain("verified pin: m/x:fireworks/fast");
+    });
+
+    test("--pick prints the bare tag and warns on stderr that the pin needs ignore", async () => {
+      const { code, stdout, stderr } = await run(() => undefined, ["m/x", "--pick"], ZDR_LIST, { list });
+      expect(stdout).toBe("fireworks");
+      expect(stderr).toBe(
+        "opp: m/x: pin needs ignore [fireworks/fast, fireworks/spot]; take routing from --json .models[].pick.routing",
+      );
+      expect(code).toBe(0);
+      const plain = await run(() => undefined, ["m/x", "--pick"]);
+      expect(plain.stdout).toBe("together");
+      expect(plain.stderr).not.toContain("pin needs ignore");
+    });
   });
 
   test("the key goes only where it is needed and is never printed", async () => {

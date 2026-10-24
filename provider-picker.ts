@@ -909,6 +909,14 @@ export async function main(argv: string[]): Promise<number> {
       const pick = pickOf(report);
       if (pick) {
         console.log(pick.tag);
+        // A script that builds `only: [tag]` from this alone would let the pin's siblings serve it.
+        const { ignore } = pinRouting(pick, report.endpoints);
+        if (ignore) {
+          console.error(
+            `${NAME}: ${report.slug}: pin needs ignore [${ignore.join(", ")}]; ` +
+              "take routing from --json .models[].pick.routing",
+          );
+        }
         const note = busyNote(report);
         if (note) console.error(`${NAME}: ${report.slug}: picked ${pick.tag}, but ${note}`);
       } else {

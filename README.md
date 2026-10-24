@@ -53,7 +53,9 @@ Pin by endpoint **tag** (`fireworks`), not provider name: one provider often
 runs several endpoints of a model at different quantizations and prices. A
 `model:provider` suffix such as `z-ai/glm-5.3:Together` does nothing;
 OpenRouter ignores it. OpenRouter's `only` matches every endpoint whose tag
-starts with the pinned tag plus `/`, so `opp` lists those in `ignore`.
+starts with the pinned tag plus `/`, so `opp` lists those in `ignore`. Scripts
+should take the routing from `--json` (`.models[].pick.routing`) rather than
+build `only: [tag]` from `--pick`.
 
 ## How it picks
 
