@@ -30,7 +30,7 @@ opp z-ai/glm-5.3 --probe cloudflare   # test all four tool_choice modes on one n
 opp z-ai/glm-5.3 --zdr      # zero-data-retention endpoints only
 opp z-ai/glm-5.3 -x RU      # drop providers headquartered or hosting in Russia
 opp z-ai/glm-5.3 -e inference-net  # never rank or pick InferenceNet
-opp z-ai/glm-5.3 -p baseten # only BaseTen's endpoints
+opp z-ai/glm-5.3 -p baseten,together  # only these providers' endpoints (a view: ranking still sees all)
 opp z-ai/glm-5.3 --json     # machine-readable
 ```
 

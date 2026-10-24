@@ -64,41 +64,42 @@ const COUNTRY = /^[A-Z]{2}$/;
 
 const USAGE = `Usage: ${NAME} <model/slug ...> [options]
 
-Rank OpenRouter's serving endpoints for each model and pick one to pin.
+Rank serving endpoints for each model and pick one to pin.
 
-Arguments:
-  model/slug ...              One or more models to rank, e.g. z-ai/glm-5.3
+Models:
+  model/slug ...                One or more models to rank, e.g. z-ai/glm-5.3
 
-Options:
-  -p, --provider <name>       Keep endpoints whose provider name or tag
-                              contains <name>, case-insensitively. A bare word
-                              without "/" works too: z-ai/glm-5.3 together
-  -x, --exclude-country <CC>  Drop endpoints whose provider is headquartered or
-                              has a datacenter in this ISO country (repeatable
-                              or comma-separated: -x CN,RU). Providers with no
-                              known location are kept and shown with "?".
-  -e, --exclude-provider <name>
-                              Drop endpoints whose provider name or tag contains
-                              <name>, matched like -p (repeatable or
-                              comma-separated: -e deepinfra,novita). Wins over -p.
-      --zdr                   Keep only zero-data-retention endpoints, per
-                              OpenRouter's ZDR list. The zdr column shows each
-                              endpoint's status either way.
-      --verify                Send a tiny request that must call a tool through
-                              each candidate's pin, best first, until one
-                              serves (needs a key). A busy endpoint (HTTP 429,
-                              5xx) is retried once, then skipped and reported
-                              as busy. Stops starting probes after 3 minutes.
-      --probe <tag>           With one model, send four paid requests to the
-                              endpoint with this exact tag, whatever its
-                              eligibility: tool_choice none, auto, required
-                              and a named function. Repeatable. Needs a key.
-                              Exit 1 if any mode fails or a tag is unknown.
-      --json                  Print machine-readable results
-      --pick                  Print only each model's chosen endpoint tag, one
-                              line per model, e.g. wafer/us. A model with no
-                              pick prints its reason to stderr instead.
-  -h, --help                  Show this help
+Eligibility:
+  -p, --provider <name,...>     Show only endpoints whose provider name or tag
+                                contains a name (any match), case-insensitively.
+                                Repeatable or comma-separated. A view: ranking
+                                still compares against all endpoints.
+  -e, --exclude-provider <name,...>
+                                Never rank or pick these providers, matched like
+                                -p. Repeatable or comma-separated. Wins over -p.
+  -x, --exclude-country <CC,...>
+                                Drop endpoints whose provider is headquartered or
+                                has a datacenter in these ISO countries.
+                                Repeatable or comma-separated. Providers with no
+                                known location are kept and shown with "?".
+      --zdr                     Keep only zero-data-retention endpoints.
+
+Probes (paid requests):
+      --verify                  Send a tiny request that must call a tool through
+                                each candidate's pin, best first, until one
+                                serves. A busy endpoint is retried once, then
+                                skipped. Stops starting probes after 3 minutes.
+      --probe <tag>             With one model, send four paid requests to the
+                                endpoint with this exact tag, whatever its
+                                eligibility: tool_choice none, auto, required
+                                and a named function. Repeatable. Exit 1 if any
+                                mode fails or a tag is unknown.
+
+Output:
+      --json                    Print machine-readable results
+      --pick                    Print only each model's chosen endpoint, one line
+                                per model
+  -h, --help                    Show this help
 
 Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential.
 Exit status: 0 if every model has a pick, 1 if any has none, 2 on usage errors.`;
@@ -153,7 +154,7 @@ type Report = {
 };
 export type Options = {
   slugs: string[];
-  provider?: string;
+  providers: string[];
   excludeProviders: string[];
   excludeCountries: string[];
   zdr: boolean;
@@ -165,6 +166,13 @@ export type Options = {
 };
 
 // ---- Arguments --------------------------------------------------------------
+
+/** A repeatable, comma-separated option's values, trimmed and deduplicated. An empty value is a usage error. */
+function listValues(raw: string[] | undefined, what: string): string[] {
+  const values = (raw ?? []).flatMap((list) => list.split(",")).map((value) => value.trim());
+  if (values.includes("")) throw new Error(`${what} must not be empty`);
+  return [...new Set(values)];
+}
 
 export function parseOptions(argv: string[]): Options {
   const { values, positionals } = parseArgs({
@@ -192,26 +200,20 @@ export function parseOptions(argv: string[]): Options {
       throw new Error("--probe can't be combined with --verify, --pick or --json");
     if (slugs.length !== 1) throw new Error("--probe takes exactly one model slug");
   }
-  const filters = [...(values.provider ?? []), ...positionals.filter((arg) => !arg.includes("/"))];
-  if (filters.length > 1) throw new Error(`give at most one provider filter, got ${filters.join(", ")}`);
-  const provider = filters[0]?.trim();
-  if (provider === "") throw new Error("provider filter must not be empty");
+  const bareWord = positionals.find((arg) => !arg.includes("/"));
+  if (bareWord !== undefined) throw new Error(`${bareWord}: not a model slug; did you mean -p ${bareWord}?`);
+  const providers = listValues(values.provider, "provider filter");
   if (!slugs.length && !values.help) throw new Error("give at least one model slug, e.g. z-ai/glm-5.3");
   const badSlug = slugs.find((slug) => !SLUG.test(slug));
   if (badSlug !== undefined) throw new Error(`not a model slug: ${badSlug}`);
-  const excludeProviders = (values["exclude-provider"] ?? [])
-    .flatMap((list) => list.split(","))
-    .map((name) => name.trim());
-  if (excludeProviders.includes("")) throw new Error("excluded provider must not be empty");
-  const excludeCountries = (values["exclude-country"] ?? [])
-    .flatMap((list) => list.split(","))
-    .map((code) => code.trim().toUpperCase());
+  const excludeProviders = listValues(values["exclude-provider"], "excluded provider");
+  const excludeCountries = listValues(values["exclude-country"], "excluded country").map((code) => code.toUpperCase());
   const badCountry = excludeCountries.find((code) => !COUNTRY.test(code));
   if (badCountry !== undefined) throw new Error(`not a two-letter country code: ${JSON.stringify(badCountry)}`);
   return {
     slugs,
-    provider,
-    excludeProviders: [...new Set(excludeProviders)],
+    providers,
+    excludeProviders,
     excludeCountries: [...new Set(excludeCountries)],
     zdr: values.zdr ?? false,
     verify: values.verify ?? false,
@@ -708,7 +710,8 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
       ...locationReasons(locationOf(ep, ctx), options.excludeCountries),
       ...(options.zdr && !zdrOf(ep, slug, ctx) ? ["not ZDR"] : []),
     ];
-    const kept = (ep: Endpoint) => options.provider === undefined || matchesProvider(ep, options.provider);
+    const kept = (ep: Endpoint) =>
+      !options.providers.length || options.providers.some((name) => matchesProvider(ep, name));
     // Excluded providers, excluded countries and --zdr are hard constraints, so they apply before
     // ranking and can't set the price guard's baseline. The provider filter is
     // only a view: it applies after ranking so the guard still compares against
@@ -796,13 +799,14 @@ function table(header: string[], rows: string[][], numeric: ReadonlySet<number>,
 
 function renderReport(report: Report, ctx: Context): string {
   const { options } = ctx;
-  const filter = options.provider === undefined ? "" : ` · provider ~ ${JSON.stringify(options.provider)}`;
+  const filter = options.providers.length
+    ? ` · provider ~ ${options.providers.map((name) => JSON.stringify(name)).join(", ")}`
+    : "";
   if (report.error) return `\n## ${report.slug}${filter}\n  fetch failed: ${report.error}`;
 
-  const count =
-    options.provider === undefined
-      ? `${report.total - report.ineligible.length} of ${report.total}`
-      : String(report.ranked.length);
+  const count = !options.providers.length
+    ? `${report.total - report.ineligible.length} of ${report.total}`
+    : String(report.ranked.length);
   const lines = [`\n## ${report.slug}${filter} · ${count} eligible`];
   if (report.malformed)
     lines.push(`  (skipped ${report.malformed} malformed endpoint${report.malformed === 1 ? "" : "s"})`);
@@ -860,7 +864,7 @@ function renderReport(report: Report, ctx: Context): string {
     ]);
     lines.push(...table(header, rows, new Set([1, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])));
   } else {
-    lines.push(`  no eligible endpoint${options.provider === undefined ? "" : " matches"}`);
+    lines.push(`  no eligible endpoint${options.providers.length ? ` matches ${options.providers.join(", ")}` : ""}`);
   }
 
   for (const { endpoint, ok, busy, detail } of report.verification?.probes ?? []) {
