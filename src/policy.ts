@@ -147,6 +147,10 @@ export type Options = {
   help: boolean;
   /** Unpinned requests to send per model with --audit-fallback. */
   auditFallback?: number;
+  /** Set by --completions: the shell to print a completion function for. */
+  completions?: string;
+  /** Set by the hidden --list-models. */
+  listModels?: boolean;
 };
 
 const own = <T>(record: Record<string, T>, key: string): T | undefined =>

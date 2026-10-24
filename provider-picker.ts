@@ -17,9 +17,18 @@
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { parseArgs } from "node:util";
-import { errorMessage, fetchEndpoints, fetchLocations, fetchZdr, sanitize, zdrKey } from "./src/openrouter.ts";
+import {
+  errorMessage,
+  fetchEndpoints,
+  fetchLocations,
+  fetchModelIds,
+  fetchZdr,
+  sanitize,
+  zdrKey,
+} from "./src/openrouter.ts";
 import {
   AUDIT_MAX_USD,
   AUDIT_PROMPT_TOKENS,
@@ -113,6 +122,8 @@ Output:
       --json                    Print machine-readable results
       --pick                    Print only each model's chosen endpoint, one line
                                 per model
+      --completions zsh         Print a zsh completion function for model slugs
+                                and flags (see README)
   -h, --help                    Show this help
   An endpoint whose listing doesn't report its quantization ranks below bf16
   and above fp8; a pin on one says "quantization not reported" (--json:
@@ -145,6 +156,8 @@ export function parseOptions(argv: string[]): Options {
       "audit-fallback": { type: "string" },
       json: { type: "boolean" },
       pick: { type: "boolean" },
+      completions: { type: "string" },
+      "list-models": { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -169,7 +182,8 @@ export function parseOptions(argv: string[]): Options {
   const bareWord = positionals.find((arg) => !arg.includes("/"));
   if (bareWord !== undefined) throw new Error(`${bareWord}: not a model slug; did you mean -p ${bareWord}?`);
   const providers = listValues(values.provider, "provider filter");
-  if (!slugs.length && !values.help) throw new Error("give at least one model slug, e.g. z-ai/glm-5.3");
+  if (!slugs.length && !values.help && values.completions === undefined && !values["list-models"])
+    throw new Error("give at least one model slug, e.g. z-ai/glm-5.3");
   const badSlug = slugs.find((slug) => !SLUG.test(slug));
   if (badSlug !== undefined) throw new Error(`not a model slug: ${badSlug}`);
   const excludeProviders = listValues(values["exclude-provider"], "excluded provider");
@@ -188,7 +202,79 @@ export function parseOptions(argv: string[]): Options {
     pick: values.pick ?? false,
     help: values.help ?? false,
     ...(audit !== undefined && { auditFallback: Number(audit) }),
+    ...(values.completions !== undefined && { completions: values.completions }),
+    ...(values["list-models"] && { listModels: true }),
   };
+}
+
+// ---- Completion -------------------------------------------------------------
+
+/** How long a fetched model list is reused, and how long a Tab press waits for a fresh one. */
+const MODEL_LIST_TTL_HOURS = 24;
+const MODEL_LIST_TIMEOUT_MS = 2000;
+
+const ZSH_COMPLETION = `#compdef ${NAME}
+# Completion for ${NAME}: model slugs (from \`${NAME} --list-models\`) and flags.
+_${NAME}_models() {
+  local -a models
+  [[ \$PREFIX == -* ]] && return 1
+  models=(\${(f)"\$(command ${NAME} --list-models 2>/dev/null)"})
+  compadd -M 'm:{a-z}={A-Z} l:|=*' -a models
+}
+_${NAME}() {
+  _arguments -s \\
+    '*'{-p,--provider}'[show only these providers]:provider:' \\
+    '*'{-e,--exclude-provider}'[never rank or pick these providers]:provider:' \\
+    '*'{-x,--exclude-country}'[drop providers in these countries]:country code:' \\
+    '--zdr[keep only zero-data-retention endpoints]' \\
+    '--verify[prove the pick serves and makes a tool call]' \\
+    '*--probe[test tool_choice modes on one endpoint]:endpoint tag:' \\
+    '--audit-fallback[measure default routing]:requests (1-${AUDIT_MAX_REQUESTS}):' \\
+    '--json[print machine-readable results]' \\
+    '--pick[print only each chosen endpoint]' \\
+    '--completions[print a completion function]:shell:(zsh)' \\
+    '(- *)'{-h,--help}'[show help]' \\
+    '*:model:_${NAME}_models'
+}
+if [[ \$funcstack[1] == _${NAME} ]]; then
+  _${NAME} "\$@"
+else
+  compdef _${NAME} ${NAME}
+fi
+`;
+
+/** Where the model list is cached, beside the probe store. */
+function modelListPath(env: Record<string, string | undefined> = process.env): string | undefined {
+  const store = probeStorePath(env);
+  return store && `${dirname(store)}/models.json`;
+}
+
+/**
+ * Model slugs for --list-models. A cache younger than MODEL_LIST_TTL_HOURS is
+ * used without fetching; otherwise the list is fetched within a short timeout
+ * and cached, and a failed fetch falls back to the stale cache, else nothing.
+ */
+export async function listModels(now = Date.now()): Promise<string[]> {
+  const path = modelListPath();
+  let cached: { at: number; slugs: string[] } | undefined;
+  try {
+    const raw = JSON.parse(readFileSync(path!, "utf8")) as { at?: unknown; slugs?: unknown };
+    if (typeof raw.at === "number" && Array.isArray(raw.slugs) && raw.slugs.every((s) => typeof s === "string"))
+      cached = { at: raw.at, slugs: raw.slugs };
+  } catch {}
+  if (cached && now - cached.at < MODEL_LIST_TTL_HOURS * 3_600_000) return cached.slugs;
+  try {
+    const slugs = (await fetchModelIds(MODEL_LIST_TIMEOUT_MS)).filter((id) => SLUG.test(id));
+    if (path) {
+      try {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, JSON.stringify({ at: now, slugs }));
+      } catch {}
+    }
+    return slugs;
+  } catch {
+    return cached?.slugs ?? [];
+  }
 }
 
 // ---- Auth -------------------------------------------------------------------
@@ -679,6 +765,19 @@ export async function main(argv: string[]): Promise<number> {
   }
   if (options.help) {
     console.log(USAGE);
+    return 0;
+  }
+
+  if (options.listModels) {
+    console.log((await listModels()).join("\n"));
+    return 0;
+  }
+  if (options.completions !== undefined) {
+    if (options.completions !== "zsh") {
+      console.error(`${NAME}: --completions supports only zsh, not ${JSON.stringify(options.completions)}`);
+      return 2;
+    }
+    console.log(ZSH_COMPLETION.trimEnd());
     return 0;
   }
 
