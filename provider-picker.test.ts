@@ -940,6 +940,21 @@ describe("--probe", () => {
     }
   });
 
+  test.each(["required", "function"])(
+    "%s fails on an error, a filter or no completion despite an ok call",
+    async (name) => {
+      const isMode = (mode: unknown) => (name === "function" ? typeof mode === "object" : mode === name);
+      for (const finish_reason of ["content_filter", "error"]) {
+        const bad = { provider: "Cloudflare", choices: [{ finish_reason, message: { tool_calls: [CALL] } }] };
+        const { code, stdout } = await run(["m/x", "--probe", "cf"], (mode) => (isMode(mode) ? bad : good(mode)));
+        expect(code).toBe(1);
+        expect(stdout).toContain(`${name}  fail`);
+      }
+      const none = { provider: "Cloudflare", choices: [] };
+      expect((await run(["m/x", "--probe", "cf"], (mode) => (isMode(mode) ? none : good(mode)))).code).toBe(1);
+    },
+  );
+
   test("a plain reply cut off by max_tokens still passes none and auto", async () => {
     const cut = { provider: "Cloudflare", choices: [{ finish_reason: "length", message: { content: "hi" } }] };
     const { code } = await run(["m/x", "--probe", "cf"], (mode) =>
