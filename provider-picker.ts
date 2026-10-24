@@ -627,7 +627,9 @@ async function attempt(
     if (mode === "auto") {
       const made = Array.isArray(calls) ? calls : [];
       const bad =
-        finish === "tool_calls" ? !made.length || !made.every(usableCall) : made.length > 0 && !made.every(usableCall);
+        finish === "tool_calls"
+          ? !made.length || !made.every(usableCall)
+          : made.length > 0 && (finish === "length" || !made.every(usableCall));
       return bad
         ? result(false, `unusable tool call, finish=${finish}`)
         : result(true, `served by ${servedBy}, finish=${finish}`);

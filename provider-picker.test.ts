@@ -918,6 +918,8 @@ describe("--probe", () => {
     const broken = await run(["m/x", "--probe", "cf"], (mode) => (mode === "auto" ? badArgs : good(mode)));
     expect(broken.code).toBe(1);
     expect(broken.stdout).toContain("cf  auto  fail  listed: yes  unusable tool call");
+    const cutCall = { provider: "Cloudflare", choices: [{ finish_reason: "length", message: { tool_calls: [CALL] } }] };
+    expect((await run(["m/x", "--probe", "cf"], (mode) => (mode === "auto" ? cutCall : good(mode)))).code).toBe(1);
     const invented = {
       ...badArgs,
       choices: [
