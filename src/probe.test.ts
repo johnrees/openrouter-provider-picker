@@ -82,6 +82,27 @@ describe("inconclusive probes", () => {
       () => new Response(JSON.stringify({ error: { message: "account", code: status } }), { status }),
     );
     expect(outcome).toMatchObject({ ok: false, busy: false, conclusive: false });
+    expect(outcome).not.toHaveProperty("refused");
+  });
+
+  test.each([401, 403])("Vercel's HTTP %d refuses the account; other statuses don't", async (status) => {
+    const vercel = ep("a", { gateway: "vercel" });
+    const reply = (code: number) => () => new Response(JSON.stringify({ error: "no access" }), { status: code });
+    const refuse = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      reply(status)()) as unknown as typeof fetch);
+    try {
+      const outcome = await probe("m/x", vercel, [], auth);
+      expect(outcome).toMatchObject({ ok: false, busy: false, conclusive: false, refused: status });
+      expect(outcome.detail).toBe(`HTTP ${status} no access`);
+    } finally {
+      refuse.mockRestore();
+    }
+    const other = spyOn(globalThis, "fetch").mockImplementation((async () => reply(404)()) as unknown as typeof fetch);
+    try {
+      expect(await probe("m/x", vercel, [], auth)).not.toHaveProperty("refused");
+    } finally {
+      other.mockRestore();
+    }
   });
 
   test("a reset while reading the body is inconclusive", async () => {

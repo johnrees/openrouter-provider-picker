@@ -1,5 +1,14 @@
 import response from "./fixtures/endpoints.json";
+import vercelResponse from "./fixtures/vercel-endpoints.json";
 import type { Endpoint } from "./policy.ts";
+
+/**
+ * A hand-written GET /models/{creator}/{model}/endpoints response from Vercel AI Gateway, with invented
+ * providers. alpha, mike and quebec share names with OpenRouter rows in the tests; oscar and papa don't.
+ * papa lists no tool_choice, quebec has a discount and a region price, and sierra is malformed.
+ */
+export const vercelFixture = vercelResponse;
+export const vercelFixtureRows: unknown[] = vercelResponse.data.endpoints;
 
 /**
  * Rows of a hand-written GET /models/{slug}/endpoints response for an anonymous

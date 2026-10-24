@@ -3,15 +3,18 @@
 import { type Auth, COUNTRY, type Endpoint, type Location } from "./policy.ts";
 
 export const API = "https://openrouter.ai/api/v1";
-const FETCH_TIMEOUT_MS = 30_000;
+export const FETCH_TIMEOUT_MS = 30_000;
 
 /**
- * Makes upstream text safe to print. It scrubs the key and anything shaped
+ * Makes upstream text safe to print. It scrubs the keys and anything shaped
  * like an OpenRouter key, removes terminal control characters and newlines,
  * and truncates. Scrubbing runs before truncation so a cut can't hide a key.
  */
-export function sanitize(text: string, secret?: string, max = 200): string {
-  let out = secret ? text.split(secret).join("[redacted]") : text;
+export function sanitize(text: string, secrets?: string | readonly (string | undefined)[], max = 200): string {
+  let out = text;
+  for (const secret of typeof secrets === "string" ? [secrets] : (secrets ?? [])) {
+    if (secret) out = out.split(secret).join("[redacted]");
+  }
   out = out
     .replace(/sk-or-[\w-]+/g, "[redacted]")
     .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
@@ -68,7 +71,7 @@ export async function fetchEndpoints(slug: string, auth?: Auth): Promise<{ endpo
   const path = slug.split("/").map(encodeURIComponent).join("/");
   const raw = ((await getData(`/models/${path}/endpoints`, auth)) as { endpoints?: unknown } | undefined)?.endpoints;
   if (!Array.isArray(raw)) throw new Error("unexpected response: no data.endpoints array");
-  const endpoints = raw.filter(isEndpoint);
+  const endpoints = raw.filter(isEndpoint).map((ep): Endpoint => ({ ...ep, gateway: "openrouter" }));
   return { endpoints, malformed: raw.length - endpoints.length };
 }
 

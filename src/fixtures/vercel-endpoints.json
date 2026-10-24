@@ -1,0 +1,159 @@
+{
+  "data": {
+    "id": "example/agent-1",
+    "name": "Agent 1",
+    "endpoints": [
+      {
+        "name": "alpha | example/agent-1",
+        "model_name": "Agent 1",
+        "context_length": 262144,
+        "pricing": {
+          "prompt": "0.000001",
+          "completion": "0.000004",
+          "request": "0",
+          "internal_reasoning": "0",
+          "input_cache_read": "0.0000001",
+          "discount": 0
+        },
+        "provider_name": "alpha",
+        "has_zdr": true,
+        "has_no_training": true,
+        "tags": ["tool-use", "reasoning"],
+        "quantization": "fp8",
+        "max_completion_tokens": 100000,
+        "max_prompt_tokens": null,
+        "supported_parameters": ["max_tokens", "temperature", "tools", "tool_choice", "reasoning"],
+        "status": 0,
+        "uptime_last_15m": 100,
+        "uptime_last_1h": 100,
+        "uptime_last_1d": 100,
+        "latency_last_1h": { "p50": 400, "p95": 900 },
+        "throughput_last_1h": { "p50": 100, "p95": 140 },
+        "supports_implicit_caching": true
+      },
+      {
+        "name": "mike | example/agent-1",
+        "model_name": "Agent 1",
+        "context_length": 262144,
+        "pricing": {
+          "prompt": "0.000001",
+          "completion": "0.000004",
+          "request": "0",
+          "input_cache_read": "0.0000001",
+          "discount": 0
+        },
+        "provider_name": "mike",
+        "has_zdr": false,
+        "has_no_training": true,
+        "tags": ["tool-use"],
+        "quantization": "fp8",
+        "max_completion_tokens": 100000,
+        "max_prompt_tokens": null,
+        "supported_parameters": ["max_tokens", "tools", "tool_choice"],
+        "status": 0,
+        "uptime_last_15m": 100,
+        "uptime_last_1h": 100,
+        "uptime_last_1d": 100,
+        "latency_last_1h": { "p50": 200, "p95": 500 },
+        "throughput_last_1h": { "p50": 100, "p95": 140 },
+        "supports_implicit_caching": false
+      },
+      {
+        "name": "oscar | example/agent-1",
+        "model_name": "Agent 1",
+        "context_length": 262144,
+        "pricing": {
+          "prompt": "0.000001",
+          "completion": "0.000004",
+          "request": "0",
+          "input_cache_read": "0.0000001",
+          "discount": 0
+        },
+        "provider_name": "oscar",
+        "has_zdr": null,
+        "has_no_training": true,
+        "tags": ["tool-use"],
+        "quantization": "fp8",
+        "max_completion_tokens": 100000,
+        "max_prompt_tokens": null,
+        "supported_parameters": ["max_tokens", "tools", "tool_choice"],
+        "status": 0,
+        "uptime_last_15m": 100,
+        "uptime_last_1h": 100,
+        "uptime_last_1d": 100,
+        "latency_last_1h": { "p50": 100, "p95": 300 },
+        "throughput_last_1h": { "p50": 200, "p95": 260 },
+        "supports_implicit_caching": true
+      },
+      {
+        "name": "papa | example/agent-1",
+        "model_name": "Agent 1",
+        "context_length": 131072,
+        "pricing": {
+          "prompt": "0.0000005",
+          "completion": "0.000002",
+          "input_cache_read": "0.00000005",
+          "discount": 0
+        },
+        "provider_name": "papa",
+        "has_zdr": true,
+        "has_no_training": true,
+        "tags": [],
+        "quantization": null,
+        "max_completion_tokens": 32768,
+        "max_prompt_tokens": null,
+        "supported_parameters": ["max_tokens", "tools"],
+        "status": 0,
+        "uptime_last_15m": 100,
+        "uptime_last_1h": 100,
+        "uptime_last_1d": 100,
+        "latency_last_1h": { "p50": 250, "p95": 600 },
+        "throughput_last_1h": { "p50": 120, "p95": 150 },
+        "supports_implicit_caching": false
+      },
+      {
+        "name": "quebec | example/agent-1",
+        "model_name": "Agent 1",
+        "context_length": 262144,
+        "pricing": {
+          "prompt": "0.0000015",
+          "completion": "0.000006",
+          "request": "0",
+          "input_cache_read": "0.00000015",
+          "input_cache_write": "0.000002",
+          "discount": 0.25
+        },
+        "provider_name": "quebec",
+        "has_zdr": true,
+        "has_no_training": true,
+        "tags": ["tool-use", "reasoning"],
+        "quantization": "fp8",
+        "max_completion_tokens": 100000,
+        "max_prompt_tokens": null,
+        "supported_parameters": ["max_tokens", "temperature", "tools", "tool_choice", "reasoning"],
+        "status": 0,
+        "uptime_last_15m": 100,
+        "uptime_last_1h": 100,
+        "uptime_last_1d": 99.5,
+        "latency_last_1h": { "p50": 300, "p95": 800 },
+        "throughput_last_1h": { "p50": 100, "p95": 130 },
+        "supports_implicit_caching": true,
+        "inference_regions": [
+          {
+            "scope": "zone",
+            "geo_region": "us",
+            "pricing": { "prompt": "0.000003", "completion": "0.000012", "input_cache_read": "0.0000003" }
+          }
+        ]
+      },
+      {
+        "name": "sierra | example/agent-1",
+        "model_name": "Agent 1",
+        "pricing": { "prompt": "0.000001", "completion": "0.000004", "discount": 0 },
+        "provider_name": "sierra",
+        "status": 0,
+        "uptime_last_1d": 100
+      }
+    ]
+  }
+}

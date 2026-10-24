@@ -12,8 +12,9 @@
  *   "provider": { "only": ["<endpoint tag>"], "ignore": ["<longer sibling tags>"], "allow_fallbacks": false }
  *
  * README.md explains the policy. Run with --help for usage. This file is the
- * Bun command line; src/policy.ts ranks, src/openrouter.ts fetches and
- * src/probe.ts sends the paid test requests, whose results src/probe-store.ts keeps.
+ * Bun command line; src/policy.ts ranks, src/openrouter.ts and src/vercel.ts
+ * fetch, and src/probe.ts sends the paid test requests, whose results
+ * src/probe-store.ts keeps.
  */
 
 import { Database } from "bun:sqlite";
@@ -37,6 +38,9 @@ import {
   COUNTRY,
   type Endpoint,
   freshProbes,
+  GATEWAYS,
+  type Gateway,
+  gatewayOf,
   ineligibleReasons,
   listedToolChoice,
   type Location,
@@ -51,6 +55,7 @@ import {
   type Probed,
   type ProbeStore,
   pinRouting,
+  probedFor,
   probeOverrides,
   providerSlug,
   quantizationReported,
@@ -65,6 +70,16 @@ import {
 } from "./src/policy.ts";
 import { auditFallback, PROBE_MAX_TOKENS, probe, VERIFY_BUDGET_MS, verify } from "./src/probe.ts";
 import { loadProbes, probeStorePath, recordProbes } from "./src/probe-store.ts";
+import {
+  borrowToolChoice,
+  fetchVercelEndpoints,
+  resolveVercelAuth,
+  toOpenRouterSlug,
+  toVercelSlug,
+  VERCEL_KEY_VAR,
+  vercelModel,
+  vercelRouting,
+} from "./src/vercel.ts";
 
 /** The command name, as installed by package.json "bin". */
 const NAME = "opp";
@@ -78,6 +93,14 @@ Rank serving endpoints for each model and pick one to pin.
 
 Models:
   model/slug ...                One or more models to rank, e.g. z-ai/glm-5.3
+
+Sources:
+      --gateway <name,...>      Where to list endpoints: openrouter (default),
+                                vercel, cloudflare, or all (every gateway with
+                                credentials). Repeatable or comma-separated.
+  Vercel lists tool_choice but not each mode, so a Vercel row takes OpenRouter's
+  verdict for the same provider. A row whose provider isn't on OpenRouter is
+  flagged tc? and ranks after the verified rows of its uptime tier.
 
 Eligibility:
   -p, --provider <name,...>     Show only endpoints whose provider name or tag
@@ -129,7 +152,8 @@ Output:
   and above fp8; a pin on one says "quantization not reported" (--json:
   pick.quantizationReported false).
 
-Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential.
+Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential;
+${VERCEL_KEY_VAR} for Vercel probes.
 Exit status: 0 if every model has a pick, 1 if any has none, 2 on usage errors.`;
 
 // ---- Arguments --------------------------------------------------------------
@@ -141,12 +165,34 @@ function listValues(raw: string[] | undefined, what: string): string[] {
   return [...new Set(values)];
 }
 
+/** --gateway's values: every gateway opp can list, one reserved for a later source, and all. */
+const GATEWAY_NAMES: readonly string[] = [...GATEWAYS, "cloudflare", "all"];
+const DEFAULT_GATEWAYS: Gateway[] = ["openrouter"];
+const openRouterOnly = (gateways: Options["gateways"]): boolean =>
+  gateways !== "all" && gateways.length === 1 && gateways[0] === "openrouter";
+
+function parseGateways(raw: string[] | undefined): Options["gateways"] {
+  const names = [...new Set(listValues(raw, "gateway").map((name) => name.toLowerCase()))];
+  if (!names.length) return DEFAULT_GATEWAYS;
+  const unknown = names.find((name) => !GATEWAY_NAMES.includes(name));
+  if (unknown !== undefined) {
+    throw new Error(`unknown gateway ${JSON.stringify(unknown)}; use openrouter, vercel, cloudflare or all`);
+  }
+  if (names.includes("cloudflare")) throw new Error("--gateway cloudflare isn't supported yet");
+  if (names.includes("all")) {
+    if (names.length > 1) throw new Error("--gateway all can't be combined with other gateway names");
+    return "all";
+  }
+  return GATEWAYS.filter((gateway) => names.includes(gateway));
+}
+
 export function parseOptions(argv: string[]): Options {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
     strict: true,
     options: {
+      gateway: { type: "string", multiple: true },
       provider: { type: "string", short: "p", multiple: true },
       "exclude-provider": { type: "string", short: "e", multiple: true },
       "exclude-country": { type: "string", short: "x", multiple: true },
@@ -165,6 +211,7 @@ export function parseOptions(argv: string[]): Options {
   const slugs = positionals.filter((arg) => arg.includes("/"));
   const probe = (values.probe ?? []).map((tag) => tag.trim());
   if (probe.some((tag) => tag === "")) throw new Error("--probe needs an endpoint tag");
+  const gateways = parseGateways(values.gateway);
   const audit = values["audit-fallback"];
   if (audit !== undefined) {
     const n = /^\d+$/.test(audit) ? Number(audit) : NaN;
@@ -173,11 +220,16 @@ export function parseOptions(argv: string[]): Options {
         `--audit-fallback takes a whole number from 1 to ${AUDIT_MAX_REQUESTS}, not ${JSON.stringify(audit)}`,
       );
     if (values.pick) throw new Error("--audit-fallback can't be combined with --pick, whose output is only the pin");
+    if (!openRouterOnly(gateways)) {
+      throw new Error("--audit-fallback measures OpenRouter's default routing; it takes no --gateway but openrouter");
+    }
   }
   if (probe.length) {
     if (values.verify || values.pick || values.json || audit !== undefined)
       throw new Error("--probe can't be combined with --verify, --audit-fallback, --pick or --json");
     if (slugs.length !== 1) throw new Error("--probe takes exactly one model slug");
+    if (!openRouterOnly(gateways))
+      throw new Error("--probe tests OpenRouter endpoints; it takes no --gateway but openrouter");
   }
   const bareWord = positionals.find((arg) => !arg.includes("/"));
   if (bareWord !== undefined) throw new Error(`${bareWord}: not a model slug; did you mean -p ${bareWord}?`);
@@ -192,6 +244,7 @@ export function parseOptions(argv: string[]): Options {
   if (badCountry !== undefined) throw new Error(`not a two-letter country code: ${JSON.stringify(badCountry)}`);
   return {
     slugs,
+    gateways,
     providers,
     excludeProviders,
     excludeCountries: [...new Set(excludeCountries)],
@@ -223,6 +276,7 @@ _${NAME}_models() {
 }
 _${NAME}() {
   _arguments -s \\
+    '*--gateway[where to list endpoints]:gateway:(openrouter vercel all)' \\
     '*'{-p,--provider}'[show only these providers]:provider:' \\
     '*'{-e,--exclude-provider}'[never rank or pick these providers]:provider:' \\
     '*'{-x,--exclude-country}'[drop providers in these countries]:country code:' \\
@@ -353,7 +407,12 @@ async function probeTags(slug: string, tags: readonly string[], auth: Auth): Pro
 /** `auditBudget` is what the audits of every model may still spend, shared so the cap holds on actual spend. */
 type Context = {
   options: Options;
+  /** The gateways this run lists, with --gateway all resolved. */
+  gateways: Gateway[];
+  /** OpenRouter's key, sent only to OpenRouter. */
   auth?: Auth;
+  /** Each gateway's key for probes, sent only to that gateway. */
+  keys: Partial<Record<Gateway, Auth>>;
   locations?: Map<string, Location>;
   zdr?: Set<string>;
   auditBudget?: { usd: number };
@@ -362,23 +421,118 @@ type Context = {
   now: Date;
 };
 
-const locationOf = (ep: Endpoint, { locations }: Context): Location | undefined => locations?.get(providerSlug(ep));
+/** Every key this run holds, so any of them is scrubbed from what it prints. */
+const secretsOf = ({ keys }: Context): (string | undefined)[] => GATEWAYS.map((gateway) => keys[gateway]?.key);
 
-/** Whether an endpoint is zero-data-retention, or undefined when the ZDR list is unavailable. */
+/** A provider's location, looked up under its OpenRouter slug: another gateway's slug goes through the alias map. */
+const locationOf = (ep: Endpoint, { locations }: Context): Location | undefined =>
+  locations?.get(gatewayOf(ep) === "openrouter" ? providerSlug(ep) : toOpenRouterSlug(ep.tag).toLowerCase());
+
+/**
+ * Whether an endpoint is zero-data-retention, or undefined when unknown: OpenRouter rows are looked up in
+ * its ZDR list, which covers no other gateway, and Vercel rows carry their own flag.
+ */
 const zdrOf = (ep: Endpoint, slug: string, { zdr }: Context): boolean | undefined =>
-  zdr?.has(zdrKey(ep.model_id ?? slug, ep.tag));
+  gatewayOf(ep) === "openrouter" ? zdr?.has(zdrKey(ep.model_id ?? slug, ep.tag)) : (ep.has_zdr ?? undefined);
+
+/** The provider's slug on the other gateway, through the alias map. */
+const aliasOf = (ep: Endpoint): string =>
+  (gatewayOf(ep) === "openrouter" ? toVercelSlug(providerSlug(ep)) : toOpenRouterSlug(ep.tag)).toLowerCase();
+
+/**
+ * -p and -e match a provider by either gateway's spelling, as a substring like matchesProvider, so -p amazon
+ * keeps Vercel's bedrock and -e togetherai drops OpenRouter's together as well as Vercel's togetherai.
+ */
+const matches = (ep: Endpoint, name: string): boolean =>
+  matchesProvider(ep, name) || aliasOf(ep).includes(name.toLowerCase());
+
+/**
+ * What --pick prints for an endpoint: the bare tag on OpenRouter, `<gateway>:<route>` on any other gateway.
+ * OpenRouter tags never contain ":", so each line parses unambiguously.
+ */
+export const routeOf = (ep: Endpoint): string =>
+  gatewayOf(ep) === "openrouter" ? ep.tag : `${gatewayOf(ep)}:${ep.tag}`;
+
+/** The gateway's id for the model. */
+const modelOn = (ep: Endpoint, slug: string): string => (gatewayOf(ep) === "vercel" ? vercelModel(slug) : slug);
+
+/** The pin as text: `model:tag` on OpenRouter, `<model> <gateway>:<route>` on another gateway, ending in --pick's line. */
+const pinOf = (ep: Endpoint, slug: string): string =>
+  gatewayOf(ep) === "openrouter" ? `${slug}:${ep.tag}` : `${modelOn(ep, slug)} ${routeOf(ep)}`;
+
+/** The request field that pins an endpoint in its gateway's syntax, and its value. */
+const routingOf = (ep: Endpoint, report: Report) =>
+  gatewayOf(ep) === "openrouter"
+    ? { field: "provider", value: pinRouting(ep, report.endpoints) as object }
+    : { field: "providerOptions", value: vercelRouting(ep) as object };
+
+/** Where each mode's tool_choice support comes from. Another gateway's rows borrow OpenRouter's verdict or have none. */
+function choiceSource(ep: Endpoint, report: Report): Record<string, string> {
+  if (gatewayOf(ep) === "openrouter") return toolChoiceSource(probedFor(report.probed, ep));
+  const source =
+    ep.tool_choice_from !== undefined ? "openrouter" : ep.tool_choice_unverified ? "unverified" : "listing";
+  return Object.fromEntries(TOOL_CHOICE_MODES.map((mode) => [mode, source]));
+}
+
+/**
+ * Fetches a model's endpoints from every gateway this run lists. OpenRouter's are fetched whenever another
+ * gateway is listed too, for the tool_choice verdicts that gateway's rows borrow. A gateway whose fetch fails
+ * is noted and the others' rows rank alone; the report is an error only when every gateway failed.
+ */
+async function fetchRows(
+  slug: string,
+  ctx: Context,
+): Promise<{ endpoints: Endpoint[]; malformed: number; errors: { gateway: Gateway; error: string }[] }> {
+  const { gateways, auth } = ctx;
+  const [openrouter, vercel] = await Promise.allSettled([
+    fetchEndpoints(slug, auth),
+    gateways.includes("vercel") ? fetchVercelEndpoints(slug) : Promise.resolve({ endpoints: [], malformed: 0 }),
+  ]);
+  const verdicts = openrouter.status === "fulfilled" ? openrouter.value.endpoints : undefined;
+  const failed = (gateway: Gateway, reason: unknown) => ({
+    gateway,
+    error: sanitize(errorMessage(reason), secretsOf(ctx)),
+  });
+  const endpoints: Endpoint[] = [];
+  let malformed = 0;
+  const errors: { gateway: Gateway; error: string }[] = [];
+  for (const gateway of gateways) {
+    const result = gateway === "openrouter" ? openrouter : vercel;
+    if (result.status === "rejected") {
+      errors.push(failed(gateway, result.reason));
+      continue;
+    }
+    endpoints.push(
+      ...(gateway === "openrouter" ? result.value.endpoints : borrowToolChoice(result.value.endpoints, verdicts)),
+    );
+    malformed += result.value.malformed;
+  }
+  // Without OpenRouter's endpoints, another gateway's rows have no verdict to borrow; say why they are unverified.
+  if (!gateways.includes("openrouter") && openrouter.status === "rejected") {
+    errors.push(failed("openrouter", openrouter.reason));
+  }
+  return { endpoints, malformed, errors };
+}
 
 async function buildReport(slug: string, ctx: Context): Promise<Report> {
-  const { options, auth } = ctx;
+  const { options, gateways } = ctx;
   try {
-    const { endpoints, malformed } = await fetchEndpoints(slug, auth);
+    const { endpoints, malformed, errors } = await fetchRows(slug, ctx);
+    // Only the listed gateways' failures can empty the report; OpenRouter's verdict fetch failing is a note.
+    const failed = errors.filter(({ gateway }) => gateways.includes(gateway));
+    if (failed.length === gateways.length) {
+      throw new Error(
+        openRouterOnly(gateways)
+          ? failed[0]!.error
+          : failed.map(({ gateway, error }) => `${gateway}: ${error}`).join("; "),
+      );
+    }
     const excludedBy = (ep: Endpoint) => [
-      ...options.excludeProviders.filter((name) => matchesProvider(ep, name)).map((name) => `excluded: ${name}`),
+      ...options.excludeProviders.filter((name) => matches(ep, name)).map((name) => `excluded: ${name}`),
       ...locationReasons(locationOf(ep, ctx), options.excludeCountries),
-      ...(options.zdr && !zdrOf(ep, slug, ctx) ? ["not ZDR"] : []),
+      ...(options.zdr && !zdrOf(ep, slug, ctx) ? [zdrOf(ep, slug, ctx) === undefined ? "ZDR unknown" : "not ZDR"] : []),
     ];
-    const kept = (ep: Endpoint) =>
-      !options.providers.length || options.providers.some((name) => matchesProvider(ep, name));
+    const kept = (ep: Endpoint) => !options.providers.length || options.providers.some((name) => matches(ep, name));
     // Excluded providers, excluded countries and --zdr are hard constraints, so they apply before
     // ranking and can't set the price guard's baseline. The provider filter is
     // only a view: it applies after ranking so the guard still compares against
@@ -392,14 +546,23 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
       .filter(kept)
       .map((endpoint) => ({
         endpoint,
-        reasons: [...ineligibleReasons(endpoint, probed.get(endpoint.tag)), ...excludedBy(endpoint)],
+        reasons: [...ineligibleReasons(endpoint, probedFor(probed, endpoint)), ...excludedBy(endpoint)],
       }))
       .filter(({ reasons }) => reasons.length);
-    return { slug, total: endpoints.length, malformed, endpoints, ranked, ineligible, probed };
+    return {
+      slug,
+      total: endpoints.length,
+      malformed,
+      endpoints,
+      ranked,
+      ineligible,
+      probed,
+      ...(errors.length && { gatewayErrors: errors }),
+    };
   } catch (error) {
     return {
       slug,
-      error: sanitize(errorMessage(error), auth?.key),
+      error: sanitize(errorMessage(error), secretsOf(ctx)),
       total: 0,
       malformed: 0,
       endpoints: [],
@@ -414,23 +577,28 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
  * Sends a report's paid requests: --verify first, since it decides the pick, then the audit in whatever is
  * left of the same time budget.
  */
-async function sendProbes(report: Report, { options, auth, auditBudget }: Context): Promise<Report> {
+async function sendProbes(report: Report, { options, auth, keys, auditBudget }: Context): Promise<Report> {
   const n = options.auditFallback;
-  if (report.error || !auth || (!options.verify && n === undefined)) return report;
+  if (report.error || (!options.verify && n === undefined)) return report;
+  // Probes on every gateway share one time budget.
   const deadline = Date.now() + VERIFY_BUDGET_MS;
   const verification =
     options.verify && report.ranked.length
-      ? await verify(report.slug, report.ranked, report.endpoints, auth, deadline)
+      ? await verify(report.slug, report.ranked, report.endpoints, keys, deadline)
       : undefined;
-  // --verify probes in the default mode, required, through each candidate's pin. The audit is unpinned, so it
-  // says nothing about any one endpoint and is never stored.
-  if (verification)
+  // --verify probes in the default mode, required, through each candidate's pin. Only OpenRouter probes are
+  // stored, since the store is keyed by OpenRouter tag. The audit is unpinned, so it says nothing about any one
+  // endpoint and is never stored.
+  const stored = (verification?.probes ?? []).filter(({ endpoint }) => gatewayOf(endpoint) === "openrouter");
+  if (stored.length)
     storeProbes(
       report.slug,
-      verification.probes.map((probe) => ({ probe, mode: "required" as const })),
+      stored.map((probe) => ({ probe, mode: "required" as const })),
     );
   const audit =
-    n === undefined ? undefined : await auditFallback(report.slug, n, report.endpoints, auth, deadline, auditBudget);
+    n === undefined || !auth
+      ? undefined
+      : await auditFallback(report.slug, n, report.endpoints, auth, deadline, auditBudget);
   return { ...report, ...(verification && { verification }), ...(audit && { audit }) };
 }
 
@@ -470,15 +638,30 @@ function noPickReason(report: Report): string {
   if (report.error) return `fetch failed: ${report.error}`;
   if (report.verification) {
     const { probes, unprobed } = report.verification;
-    const notes = [busyNote(report), unprobed ? `${unprobed} not probed: ${budgetNote}` : ""].filter(Boolean);
+    const notes = [busyNote(report), haltNote(report), unprobed ? `${unprobed} not probed: ${budgetNote}` : ""].filter(
+      Boolean,
+    );
     return `no candidate served after ${probes.length} probe(s)${notes.length ? ` (${notes.join("; ")})` : ""}`;
   }
   return "no eligible endpoint";
 }
 
+/**
+ * Names each gateway that refused the account and how many of its candidates were skipped; "" when none did.
+ * The gateway's own message is in its probe's detail, printed once.
+ */
+function haltNote(report: Report): string {
+  return (report.verification?.halted ?? [])
+    .map(({ gateway, status, skipped }) => `${gateway} refused the account (HTTP ${status}), ${skipped} not probed`)
+    .join("; ");
+}
+
+/** The probe with which each gateway refused the account. */
+const refusals = (report: Report) => report.verification?.probes.filter(({ refused }) => refused !== undefined) ?? [];
+
 /** Names the endpoints that were only busy when probed, since a re-run may pick one; "" when there are none. */
 function busyNote(report: Report): string {
-  const busy = report.verification?.probes.filter(({ busy }) => busy).map(({ endpoint }) => endpoint.tag) ?? [];
+  const busy = report.verification?.probes.filter(({ busy }) => busy).map(({ endpoint }) => routeOf(endpoint)) ?? [];
   return busy.length ? `${busy.join(", ")} ${busy.length === 1 ? "was" : "were"} busy; re-run to retry` : "";
 }
 
@@ -491,7 +674,7 @@ function probeNote(ep: Endpoint, probed: Probed | undefined): string {
 /** Whether a probe result contradicted the listing for any endpoint the report shows. */
 const probeOverrode = (report: Report): boolean =>
   [...report.ranked, ...report.ineligible].some(({ endpoint }) => {
-    const { pass, fail } = probeOverrides(endpoint, report.probed.get(endpoint.tag));
+    const { pass, fail } = probeOverrides(endpoint, probedFor(report.probed, endpoint));
     return pass.length + fail.length > 0;
   });
 
@@ -546,6 +729,7 @@ function renderReport(report: Report, ctx: Context): string {
   const lines = [`\n## ${report.slug}${filter} · ${count} eligible`];
   if (report.malformed)
     lines.push(`  (skipped ${report.malformed} malformed endpoint${report.malformed === 1 ? "" : "s"})`);
+  for (const { gateway, error } of report.gatewayErrors ?? []) lines.push(`  ${gateway}: ${error}`);
   const pick = pickOf(report);
 
   if (report.ranked.length) {
@@ -574,9 +758,13 @@ function renderReport(report: Report, ctx: Context): string {
       "eff",
       "note",
     ];
+    // One table across gateways: a gateway column follows # when more than one is listed.
+    const multi = ctx.gateways.length > 1;
+    if (multi) header.splice(2, 0, "gateway");
     const rows = report.ranked.map(({ endpoint: ep, cost, priceEliminated }, i) => [
       ep === pick ? "▶" : "",
       String(i + 1),
+      ...(multi ? [gatewayOf(ep)] : []),
       ep.tag,
       ep.quantization && ep.quantization !== "unknown" ? ep.quantization : "?",
       ...fmtWhere(locationOf(ep, ctx)),
@@ -596,23 +784,45 @@ function renderReport(report: Report, ctx: Context): string {
       yesNo(ep, "structured_outputs"),
       yesNo(ep, "reasoning"),
       yesNo(ep, "reasoning_effort"),
-      [priceEliminated ? "price-elim" : "", probeNote(ep, report.probed.get(ep.tag))].filter(Boolean).join("; "),
+      [
+        priceEliminated ? "price-elim" : "",
+        ep.tool_choice_unverified ? "tc?" : "",
+        probeNote(ep, probedFor(report.probed, ep)),
+      ]
+        .filter(Boolean)
+        .join("; "),
     ]);
-    lines.push(...table(header, rows, new Set([1, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])));
+    const numeric = [
+      "#",
+      "up1d",
+      "up30m",
+      "up5m",
+      "turn_s",
+      "ttfb",
+      "tok/s",
+      "reqs",
+      "maxout",
+      "$in",
+      "$cache",
+      "$out",
+      "$run",
+    ];
+    lines.push(...table(header, rows, new Set(numeric.map((name) => header.indexOf(name)))));
   } else {
     lines.push(`  no eligible endpoint${options.providers.length ? ` matches ${options.providers.join(", ")}` : ""}`);
   }
 
   for (const { endpoint, ok, busy, detail } of report.verification?.probes ?? []) {
-    lines.push(`  probe ${endpoint.tag}: ${ok ? "ok" : busy ? "busy" : "FAILED"} (${detail})`);
+    lines.push(`  probe ${routeOf(endpoint)}: ${ok ? "ok" : busy ? "busy" : "FAILED"} (${detail})`);
   }
   if (pick) {
+    const { field, value } = routingOf(pick, report);
     lines.push(
-      `  ${report.verification ? "verified pin" : "pin"}: ${report.slug}:${pick.tag}` +
+      `  ${report.verification ? "verified pin" : "pin"}: ${pinOf(pick, report.slug)}` +
         (quantizationReported(pick) ? "" : " (quantization not reported)"),
-      `  routing: "provider": ${JSON.stringify(pinRouting(pick, report.endpoints))}`,
+      `  routing: "${field}": ${JSON.stringify(value)}`,
     );
-    const note = busyNote(report);
+    const note = [busyNote(report), haltNote(report)].filter(Boolean).join("; ");
     if (note) lines.push(`  note: ${note}`);
   } else if (report.verification) {
     lines.push(`  ${noPickReason(report)}`);
@@ -620,14 +830,14 @@ function renderReport(report: Report, ctx: Context): string {
 
   if (report.ineligible.length) {
     lines.push(`  ineligible:`);
-    const width = Math.max(...report.ineligible.map(({ endpoint }) => endpoint.tag.length));
+    const width = Math.max(...report.ineligible.map(({ endpoint }) => routeOf(endpoint).length));
     for (const { endpoint, reasons } of report.ineligible) {
       const zdr = fmtZdr(zdrOf(endpoint, report.slug, ctx));
-      const listedYes = probeOverrides(endpoint, report.probed.get(endpoint.tag)).fail;
+      const listedYes = probeOverrides(endpoint, probedFor(report.probed, endpoint)).fail;
       const shown = reasons.map((reason) =>
         reason.startsWith("probed: ") && listedYes.length ? `${reason} (listed yes: ${listedYes.join("/")})` : reason,
       );
-      lines.push(`    ${endpoint.tag.padEnd(width)}  zdr ${zdr}  ${shown.join("; ")}`);
+      lines.push(`    ${routeOf(endpoint).padEnd(width)}  zdr ${zdr}  ${shown.join("; ")}`);
     }
   }
   if (report.audit) lines.push(...renderAudit(report.audit));
@@ -687,12 +897,16 @@ function reportJson(report: Report, ctx: Context) {
   return {
     model: report.slug,
     ...(report.error === undefined ? {} : { error: report.error }),
+    ...(report.gatewayErrors && { gatewayErrors: report.gatewayErrors }),
     pick: pick
       ? {
-          pin: `${report.slug}:${pick.tag}`,
+          pin: pinOf(pick, report.slug),
+          gateway: gatewayOf(pick),
+          model: modelOn(pick, report.slug),
           endpoint: pick.tag,
           provider: pick.provider_name,
-          routing: pinRouting(pick, report.endpoints),
+          // The value of the request field the gateway reads: `provider` on OpenRouter, `providerOptions` on Vercel.
+          routing: routingOf(pick, report).value,
           verified: report.verification !== undefined,
           quantizationReported: quantizationReported(pick),
         }
@@ -701,6 +915,7 @@ function reportJson(report: Report, ctx: Context) {
       const location = locationOf(ep, ctx);
       return {
         rank: i + 1,
+        gateway: gatewayOf(ep),
         endpoint: ep.tag,
         provider: ep.provider_name,
         quantization: ep.quantization ?? null,
@@ -727,24 +942,29 @@ function reportJson(report: Report, ctx: Context) {
         structuredOutputs: ep.supported_parameters.includes("structured_outputs"),
         reasoning: ep.supported_parameters.includes("reasoning"),
         reasoningEffort: ep.supported_parameters.includes("reasoning_effort"),
-        toolChoiceSource: toolChoiceSource(report.probed.get(ep.tag)),
+        toolChoiceVerified: !ep.tool_choice_unverified,
+        toolChoiceSource: choiceSource(ep, report),
       };
     }),
     ineligible: report.ineligible.map(({ endpoint, reasons }) => ({
+      gateway: gatewayOf(endpoint),
       endpoint: endpoint.tag,
       provider: endpoint.provider_name,
       zdr: zdrOf(endpoint, report.slug, ctx) ?? null,
       reasons,
-      toolChoiceSource: toolChoiceSource(report.probed.get(endpoint.tag)),
+      toolChoiceVerified: !endpoint.tool_choice_unverified,
+      toolChoiceSource: choiceSource(endpoint, report),
     })),
     ...(report.verification && {
       probes: report.verification.probes.map(({ endpoint, ok, busy, detail }) => ({
+        gateway: gatewayOf(endpoint),
         endpoint: endpoint.tag,
         ok,
         busy,
         detail,
       })),
       notProbed: report.verification.unprobed ?? 0,
+      halted: report.verification.halted ?? [],
     }),
     audit: report.audit?.samples ?? null,
     auditUnsent: report.audit?.unsent ?? null,
@@ -754,6 +974,33 @@ function reportJson(report: Report, ctx: Context) {
 }
 
 // ---- Main -------------------------------------------------------------------
+
+const KEY_VARS: Record<Gateway, string> = { openrouter: "OPENROUTER_API_KEY", vercel: VERCEL_KEY_VAR };
+
+/**
+ * The gateways this run lists. Listing needs no key anywhere; --verify needs the key of each gateway it
+ * probes. A named gateway without it is a usage error (undefined, after printing why); --gateway all skips
+ * it and says so on one stderr line.
+ */
+function resolveGateways(options: Options, keys: Context["keys"]): Gateway[] | undefined {
+  const lacking = (gateway: Gateway) => options.verify && !keys[gateway];
+  const needKey = (vars: string) => `${NAME}: --verify sends real requests and needs an API key; set ${vars}`;
+  if (options.gateways !== "all") {
+    const missing = options.gateways.filter(lacking);
+    if (!missing.length) return options.gateways;
+    console.error(needKey(missing.map((gateway) => KEY_VARS[gateway]).join(" and ")));
+    return undefined;
+  }
+  const skipped = GATEWAYS.filter(lacking);
+  if (skipped.length) {
+    const why = skipped.map((gateway) => `${gateway} (no ${KEY_VARS[gateway]})`).join(", ");
+    console.error(`${NAME}: --gateway all: skipping ${why}`);
+  }
+  const gateways = GATEWAYS.filter((gateway) => !lacking(gateway));
+  if (gateways.length) return gateways;
+  console.error(needKey(GATEWAYS.map((gateway) => KEY_VARS[gateway]).join(" or ")));
+  return undefined;
+}
 
 export async function main(argv: string[]): Promise<number> {
   let options: Options;
@@ -782,10 +1029,9 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   const auth = resolveAuth();
-  if (options.verify && !auth) {
-    console.error(`${NAME}: --verify sends real requests and needs an API key; set OPENROUTER_API_KEY`);
-    return 2;
-  }
+  const keys: Context["keys"] = { openrouter: auth, vercel: resolveVercelAuth(process.env) };
+  const gateways = resolveGateways(options, keys);
+  if (gateways === undefined) return 2;
   if (options.auditFallback !== undefined && !auth) {
     console.error(`${NAME}: --audit-fallback sends real requests and needs an API key; set OPENROUTER_API_KEY`);
     return 2;
@@ -797,7 +1043,7 @@ export async function main(argv: string[]): Promise<number> {
     }
     return (await probeTags(options.slugs[0]!, options.probe, auth)) ? 0 : 1;
   }
-  if (!auth) {
+  if (!auth && gateways.includes("openrouter")) {
     console.error(
       `${NAME}: no API key found. OpenRouter hides latency and throughput from anonymous callers, ` +
         "so speed is not ranked. Set OPENROUTER_API_KEY.",
@@ -807,8 +1053,12 @@ export async function main(argv: string[]): Promise<number> {
   // Reference data for the location and ZDR columns. A filter that needs it
   // can't run without it; otherwise its column just shows "?".
   const settle = <T>(lookup: Promise<T>) =>
-    lookup.catch((error: unknown) => new Error(sanitize(errorMessage(error), auth?.key)));
-  const [locations, zdr] = await Promise.all([settle(fetchLocations()), settle(fetchZdr())]);
+    lookup.catch((error: unknown) => new Error(sanitize(errorMessage(error), [auth?.key, keys.vercel?.key])));
+  // OpenRouter's ZDR list covers only its own endpoints.
+  const [locations, zdr] = await Promise.all([
+    settle(fetchLocations()),
+    gateways.includes("openrouter") ? settle(fetchZdr()) : undefined,
+  ]);
   const lookups = [
     {
       result: locations,
@@ -816,7 +1066,8 @@ export async function main(argv: string[]): Promise<number> {
       flag: "--exclude-country",
       needed: options.excludeCountries.length > 0,
     },
-    { result: zdr, what: "the ZDR endpoint list", flag: "--zdr", needed: options.zdr },
+    // With another gateway listed, --zdr still runs without OpenRouter's list: its rows are excluded as unknown.
+    { result: zdr, what: "the ZDR endpoint list", flag: "--zdr", needed: options.zdr && openRouterOnly(gateways) },
   ];
   for (const { result, what, flag, needed } of lookups) {
     if (!(result instanceof Error)) continue;
@@ -831,7 +1082,9 @@ export async function main(argv: string[]): Promise<number> {
   const ctx: Context = {
     auditBudget: { usd: AUDIT_MAX_USD },
     options,
+    gateways,
     auth,
+    keys,
     locations: locations instanceof Error ? undefined : locations,
     zdr: zdr instanceof Error ? undefined : zdr,
     probes: loadProbes(probeStorePath()),
@@ -865,10 +1118,18 @@ export async function main(argv: string[]): Promise<number> {
     for (const next of pending) {
       const report = await next;
       const pick = pickOf(report);
+      // A gateway that failed left the comparison incomplete; stdout still carries only the pick.
+      for (const { gateway, error } of report.gatewayErrors ?? []) {
+        console.error(`${NAME}: ${report.slug}: ${gateway}: ${error}`);
+      }
+      // stdout has no probe lines, so a gateway's refusal is told here, once.
+      for (const { endpoint, detail } of refusals(report)) {
+        console.error(`${NAME}: ${report.slug}: ${gatewayOf(endpoint)}: ${detail}`);
+      }
       if (pick) {
-        console.log(pick.tag);
+        console.log(routeOf(pick));
         // A script that builds `only: [tag]` from this alone would let the pin's siblings serve it.
-        const { ignore } = pinRouting(pick, report.endpoints);
+        const { ignore } = gatewayOf(pick) === "openrouter" ? pinRouting(pick, report.endpoints) : {};
         if (ignore) {
           console.error(
             `${NAME}: ${report.slug}: pin needs ignore [${ignore.join(", ")}]; ` +
@@ -876,7 +1137,7 @@ export async function main(argv: string[]): Promise<number> {
           );
         }
         const note = busyNote(report);
-        if (note) console.error(`${NAME}: ${report.slug}: picked ${pick.tag}, but ${note}`);
+        if (note) console.error(`${NAME}: ${report.slug}: picked ${routeOf(pick)}, but ${note}`);
       } else {
         ok = false;
         console.error(`${NAME}: ${report.slug}: ${noPickReason(report)}`);
@@ -892,6 +1153,7 @@ export async function main(argv: string[]): Promise<number> {
           authenticated: auth !== undefined,
           excludeProviders: options.excludeProviders,
           excludeCountries: options.excludeCountries,
+          gateways,
           zdrOnly: options.zdr,
           models: reports.map((report) => reportJson(report, ctx)),
         },
@@ -906,16 +1168,22 @@ export async function main(argv: string[]): Promise<number> {
   } else {
     // The eligibility line says whether a probe overrode a listing, so it waits for every report.
     const reports = await Promise.all(pending);
-    console.log(`# OpenRouter endpoint ranking · ${new Date().toISOString()} · auth: ${auth?.source ?? "anonymous"}`);
+    const sources = openRouterOnly(gateways) ? "" : ` (${gateways.join(", ")})`;
+    const vercel = gateways.includes("vercel");
     console.log(
-      `# eligible: native tools, status 0, tool_choice ${TOOL_CHOICE_MODES.join("/")}` +
+      `# ${sources ? "Endpoint" : "OpenRouter endpoint"} ranking · ${new Date().toISOString()} · ` +
+        `auth: ${auth?.source ?? "anonymous"}`,
+    );
+    console.log(
+      `# eligible${sources}: native tools, status 0, tool_choice ${TOOL_CHOICE_MODES.join("/")}` +
         (reports.some(probeOverrode) ? ", probe results override listings" : "") +
         (options.excludeProviders.length ? `, excluding ${options.excludeProviders.join(", ")}` : "") +
         (options.excludeCountries.length ? `, not in ${options.excludeCountries.join("/")}` : "") +
         (options.zdr ? ", ZDR only" : ""),
     );
     console.log(
-      `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties) > turn_s > ttfb > quant > maxout > $run, ` +
+      `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties) > ${vercel ? "verified tool_choice > " : ""}` +
+        "turn_s > ttfb > quant > maxout > $run, " +
         `price-elim last; turn_s = ttfb + ${TURN_OUTPUT_TOKENS} tokens at tok/s; ` +
         `quant fp4 < fp8 < ? (not reported) < bf16`,
     );
@@ -927,9 +1195,19 @@ export async function main(argv: string[]): Promise<number> {
       `# prices: USD per million tokens; $run = ${REFERENCE_RUN.prompt / 1000}k in + ` +
         `${REFERENCE_RUN.cacheRead / 1_000_000}M cache read + ${REFERENCE_RUN.completion / 1000}k out`,
     );
+    if (vercel) {
+      console.log("# vercel rows: up30m = uptime 1h, up5m = uptime 15m, ttfb and tok/s = 1h p50");
+      console.log("# tc?: tool_choice listed without per-mode support or an OpenRouter verdict; --verify proves it");
+    }
     for (const report of reports) {
       ok &&= pickOf(report) !== undefined;
       console.log(renderReport(report, ctx));
+    }
+    if (vercel) {
+      console.log(
+        "\n# fees: OpenRouter adds 5.5% (min $0.80) to card credit purchases; Vercel AI Gateway adds no markup. " +
+          "$run includes neither.",
+      );
     }
   }
   return ok ? 0 : 1;

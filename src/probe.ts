@@ -9,12 +9,15 @@ import {
   type AuditSample,
   type Auth,
   type Endpoint,
+  type Gateway,
+  gatewayOf,
   pinRouting,
   type Probe,
   type Ranked,
   type ToolChoiceMode,
   type Verification,
 } from "./policy.ts";
+import { servedProvider, VERCEL_API, vercelModel, vercelRouting } from "./vercel.ts";
 
 /** Generous for a one-tool-call reply; a pin that takes longer is not one to pick. */
 const PROBE_TIMEOUT_MS = 30_000;
@@ -65,7 +68,14 @@ const usableCall = (c: unknown): boolean => {
  * wrong endpoint, or one cut off by the token budget) says nothing about
  * support, apart from a tool call under tool_choice none.
  */
-type Attempt = { ok: boolean; detail: string; retryInMs?: number; timedOut?: boolean; judged?: boolean };
+type Attempt = {
+  ok: boolean;
+  detail: string;
+  retryInMs?: number;
+  timedOut?: boolean;
+  judged?: boolean;
+  refused?: number;
+};
 
 const isTimeout = (error: unknown): boolean => error instanceof Error && error.name === "TimeoutError";
 
@@ -74,14 +84,24 @@ export function toolChoiceFor(mode: ToolChoiceMode) {
   return mode === "function" ? { type: "function", function: { name: PROBE_TOOL } } : mode;
 }
 
+/** Each gateway's chat completions URL. A probe goes to the gateway that lists its endpoint. */
+const CHAT_URL: Record<Gateway, string> = {
+  openrouter: `${API}/chat/completions`,
+  vercel: `${VERCEL_API}/chat/completions`,
+};
+
 /**
- * The probe request body: one tiny completion pinned to `ep`, with the given tool_choice mode. With no `ep`
- * it carries no routing preferences, so OpenRouter's default routing chooses the provider.
+ * The probe request body: one tiny completion pinned to `ep` in its gateway's syntax, with the given
+ * tool_choice mode. With no `ep` it carries no routing preferences, so OpenRouter's default routing chooses
+ * the provider.
  */
 export function probeBody(slug: string, ep: Endpoint | null, endpoints: readonly Endpoint[], mode: ToolChoiceMode) {
+  const vercel = ep !== null && gatewayOf(ep) === "vercel";
+  const routing: { provider?: object; providerOptions?: object } =
+    ep === null ? {} : vercel ? { providerOptions: vercelRouting(ep) } : { provider: pinRouting(ep, endpoints) };
   return {
-    model: slug,
-    ...(ep && { provider: pinRouting(ep, endpoints) }),
+    model: vercel ? vercelModel(slug) : slug,
+    ...routing,
     max_tokens: PROBE_MAX_TOKENS,
     // Eligibility trusts the endpoint's advertised tool support, so the probe exercises it.
     tools: [{ type: "function", function: { name: PROBE_TOOL, parameters: { type: "object", properties: {} } } }],
@@ -142,8 +162,8 @@ export function toolCallProblem(body: ChatResponse | null, mode: ToolChoiceMode 
 }
 
 /**
- * Sends one minimal completion pinned to `ep`, retrying once if the endpoint
- * is busy. Account data controls, such as zero-retention or data-collection
+ * Sends one minimal completion pinned to `ep` through its gateway with that
+ * gateway's key, retrying once if the endpoint is busy. Account data controls, such as zero-retention or data-collection
  * exclusions, are enforced only at routing time and appear in no API field. A
  * real request is the only way to learn whether this account can use an
  * endpoint.
@@ -165,6 +185,7 @@ export async function probe(
       conclusive: !busy && first.judged === true,
       detail: first.detail,
       at: new Date().toISOString(),
+      ...(first.refused !== undefined && { refused: first.refused }),
     };
   }
   await new Promise((resolve) => setTimeout(resolve, first.retryInMs));
@@ -177,6 +198,7 @@ export async function probe(
     conclusive: !busy && second.judged === true,
     at: new Date().toISOString(),
     detail: `${second.detail}, ${second.ok ? "after a retry" : "retried"}`,
+    ...(second.refused !== undefined && { refused: second.refused }),
   };
 }
 
@@ -194,7 +216,7 @@ async function attempt(
   });
   const verdict = (ok: boolean, detail: string): Attempt => ({ ...result(ok, detail), judged: true });
   try {
-    const res = await fetch(`${API}/chat/completions`, {
+    const res = await fetch(CHAT_URL[gatewayOf(ep)], {
       method: "POST",
       headers: { Authorization: `Bearer ${auth.key}`, "Content-Type": "application/json" },
       redirect: "error",
@@ -210,21 +232,36 @@ async function attempt(
         return null;
       }
     })();
-    const upstream = body?.error?.message;
+    // Vercel may give the error as a plain string.
+    const error = body?.error as ChatResponse["error"] | string | undefined;
+    const upstream = typeof error === "string" ? error : error?.message;
     if (!res.ok || upstream != null) {
       // OpenRouter can also report an upstream rate limit as an error body on a 200.
       const status = res.ok ? Number(body?.error?.code) : res.status;
       const retryInMs = TRANSIENT_STATUSES.has(status) ? retryDelay(res.headers.get("retry-after")) : undefined;
       // An error can come from the account, routing or the request as a whole, so it is no verdict on tool_choice.
-      return result(false, `HTTP ${status || res.status}${upstream == null ? "" : ` ${String(upstream)}`}`, retryInMs);
+      const failed = result(
+        false,
+        `HTTP ${status || res.status}${upstream == null ? "" : ` ${String(upstream)}`}`,
+        retryInMs,
+      );
+      // Vercel answers 401 or 403 for the account or model as a whole (no key, no card, a free tier without the
+      // model), so every other endpoint there would get the same answer.
+      const refused = gatewayOf(ep) === "vercel" && (res.status === 401 || res.status === 403);
+      return refused ? { ...failed, refused: res.status } : failed;
     }
-    // Pinning makes this unreachable unless OpenRouter changes semantics. Check anyway, since verifying is the point.
-    const servedBy = typeof body?.provider === "string" ? body.provider : "an unknown provider";
+    // Pinning makes this unreachable unless the gateway changes semantics. Check anyway, since verifying is the point.
+    // OpenRouter names the provider in `provider`; Vercel in its gateway metadata's routing.finalProvider.
+    const vercel = gatewayOf(ep) === "vercel";
+    const named = vercel ? servedProvider(body) : typeof body?.provider === "string" ? body.provider : undefined;
+    const servedBy = named ?? "an unknown provider";
     if (servedBy.toLowerCase() !== ep.provider_name.toLowerCase()) return result(false, `served by ${servedBy}`);
     // A provider's tier endpoints share its name, so check the tier too. Responses call the standard tier "default".
     const tier = body?.service_tier;
     const want = ep.service_tier ?? "default";
-    if (typeof tier === "string" && tier !== want) return result(false, `served at tier ${tier}, expected ${want}`);
+    if (!vercel && typeof tier === "string" && tier !== want) {
+      return result(false, `served at tier ${tier}, expected ${want}`);
+    }
     const problem = toolCallProblem(body, mode);
     const finish = String(body?.choices?.[0]?.finish_reason ?? "none");
     const ok = problem === undefined;
@@ -240,22 +277,41 @@ async function attempt(
   }
 }
 
-/** Probes candidates in rank order and stops at the first that serves. */
+/**
+ * Probes candidates in rank order and stops at the first that serves. Each probe uses the key of its
+ * endpoint's gateway, so a key only ever goes to its own gateway. Once a gateway refuses the account, its
+ * remaining candidates are skipped and the walk goes on through the other gateways' candidates.
+ */
 export async function verify(
   slug: string,
   candidates: readonly Ranked[],
   endpoints: readonly Endpoint[],
-  auth: Auth,
+  keys: Partial<Record<Gateway, Auth>>,
   deadline = Date.now() + VERIFY_BUDGET_MS,
 ): Promise<Verification> {
   const probes: Probe[] = [];
-  for (const { endpoint } of candidates) {
-    if (Date.now() >= deadline) return { probes, unprobed: candidates.length - probes.length };
+  const halted: NonNullable<Verification["halted"]> = [];
+  const result = (rest: Partial<Verification>): Verification => ({ probes, ...(halted.length && { halted }), ...rest });
+  for (const [i, { endpoint }] of candidates.entries()) {
+    if (Date.now() >= deadline) return result({ unprobed: candidates.length - i });
+    const gateway = gatewayOf(endpoint);
+    const stopped = halted.find((entry) => entry.gateway === gateway);
+    if (stopped) {
+      stopped.skipped += 1;
+      continue;
+    }
+    const auth = keys[gateway];
+    if (!auth) {
+      const detail = `no key for ${gateway}`;
+      probes.push({ endpoint, ok: false, busy: false, conclusive: false, detail, at: new Date().toISOString() });
+      continue;
+    }
     const outcome = await probe(slug, endpoint, endpoints, auth);
     probes.push(outcome);
-    if (outcome.ok) return { probes, verified: endpoint };
+    if (outcome.ok) return result({ verified: endpoint });
+    if (outcome.refused !== undefined) halted.push({ gateway, status: outcome.refused, skipped: 0 });
   }
-  return { probes };
+  return result({});
 }
 
 /**
