@@ -11,15 +11,15 @@
     "default": "high",
     "rules": [
       {
-        "labels": ["model:fable-*"],
+        "labels": ["model:fable*"],
         "effort": "xhigh"
       },
       {
-        "labels": ["model:opus-*", "effort:xhigh"],
+        "labels": ["model:opus*", "effort:xhigh"],
         "effort": "xhigh"
       },
       {
-        "labels": ["model:opus-*", "effort:max"],
+        "labels": ["model:opus*", "effort:max"],
         "effort": "xhigh"
       }
     ]
