@@ -27,6 +27,7 @@ opp z-ai/glm-5.3            # ranked table and the pick (several models are fine
 opp z-ai/glm-5.3 --pick     # just the chosen endpoint tag, e.g. wafer/us
 opp z-ai/glm-5.3 --verify   # prove the pick serves and makes a tool call
 opp z-ai/glm-5.3 --probe cloudflare   # test all four tool_choice modes on one named endpoint, eligible or not (4 paid requests)
+opp z-ai/glm-5.3 --audit-fallback 20   # send 20 unpinned requests and count which providers OpenRouter's default routing served, and their unusable tool calls (refuses if the worst case is over $0.50)
 opp z-ai/glm-5.3 --zdr      # zero-data-retention endpoints only
 opp z-ai/glm-5.3 -x RU      # drop providers headquartered or hosting in Russia
 opp z-ai/glm-5.3 -e inference-net  # never rank or pick InferenceNet

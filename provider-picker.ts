@@ -21,6 +21,9 @@ import { existsSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { errorMessage, fetchEndpoints, fetchLocations, fetchZdr, sanitize, zdrKey } from "./src/openrouter.ts";
 import {
+  AUDIT_MAX_USD,
+  AUDIT_PROMPT_TOKENS,
+  type Audit,
   type Auth,
   COUNTRY,
   type Endpoint,
@@ -43,11 +46,13 @@ import {
   turnMs,
   UPTIME_SATURATION,
 } from "./src/policy.ts";
-import { probe, VERIFY_BUDGET_MS, verify } from "./src/probe.ts";
+import { auditFallback, PROBE_MAX_TOKENS, probe, VERIFY_BUDGET_MS, verify } from "./src/probe.ts";
 
 /** The command name, as installed by package.json "bin". */
 const NAME = "opp";
 const SLUG = /^[a-z0-9][\w.-]*\/[a-z0-9][\w.:-]*$/i;
+/** The most unpinned requests --audit-fallback sends per model. */
+const AUDIT_MAX_REQUESTS = 50;
 
 const USAGE = `Usage: ${NAME} <model/slug ...> [options]
 
@@ -81,6 +86,13 @@ Probes (paid requests):
                                 eligibility: tool_choice none, auto, required
                                 and a named function. Repeatable. Exit 1 if any
                                 mode fails or a tag is unknown.
+      --audit-fallback <n>      Send n (1 to ${AUDIT_MAX_REQUESTS}) identical tool-call requests with
+                                no routing preferences, one at a time after
+                                --verify and within its 3 minutes, and show which
+                                providers OpenRouter's default routing served and
+                                how many tool calls were unusable. -p, -e, -x and
+                                --zdr don't apply. Shows the worst-case cost first
+                                and refuses over $${AUDIT_MAX_USD.toFixed(2)}. Never changes the pick.
 
 Output:
       --json                    Print machine-readable results
@@ -112,6 +124,7 @@ export function parseOptions(argv: string[]): Options {
       zdr: { type: "boolean" },
       verify: { type: "boolean" },
       probe: { type: "string", multiple: true },
+      "audit-fallback": { type: "string" },
       json: { type: "boolean" },
       pick: { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -121,9 +134,18 @@ export function parseOptions(argv: string[]): Options {
   const slugs = positionals.filter((arg) => arg.includes("/"));
   const probe = (values.probe ?? []).map((tag) => tag.trim());
   if (probe.some((tag) => tag === "")) throw new Error("--probe needs an endpoint tag");
+  const audit = values["audit-fallback"];
+  if (audit !== undefined) {
+    const n = /^\d+$/.test(audit) ? Number(audit) : NaN;
+    if (!(n >= 1 && n <= AUDIT_MAX_REQUESTS))
+      throw new Error(
+        `--audit-fallback takes a whole number from 1 to ${AUDIT_MAX_REQUESTS}, not ${JSON.stringify(audit)}`,
+      );
+    if (values.pick) throw new Error("--audit-fallback can't be combined with --pick, whose output is only the pin");
+  }
   if (probe.length) {
-    if (values.verify || values.pick || values.json)
-      throw new Error("--probe can't be combined with --verify, --pick or --json");
+    if (values.verify || values.pick || values.json || audit !== undefined)
+      throw new Error("--probe can't be combined with --verify, --audit-fallback, --pick or --json");
     if (slugs.length !== 1) throw new Error("--probe takes exactly one model slug");
   }
   const bareWord = positionals.find((arg) => !arg.includes("/"));
@@ -147,6 +169,7 @@ export function parseOptions(argv: string[]): Options {
     json: values.json ?? false,
     pick: values.pick ?? false,
     help: values.help ?? false,
+    ...(audit !== undefined && { auditFallback: Number(audit) }),
   };
 }
 
@@ -241,9 +264,7 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
       .filter(kept)
       .map((endpoint) => ({ endpoint, reasons: [...ineligibleReasons(endpoint), ...excludedBy(endpoint)] }))
       .filter(({ reasons }) => reasons.length);
-    const verification =
-      options.verify && auth && ranked.length ? await verify(slug, ranked, endpoints, auth) : undefined;
-    return { slug, total: endpoints.length, malformed, endpoints, ranked, ineligible, verification };
+    return { slug, total: endpoints.length, malformed, endpoints, ranked, ineligible };
   } catch (error) {
     return {
       slug,
@@ -255,6 +276,31 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
       ineligible: [],
     };
   }
+}
+
+/**
+ * Sends a report's paid requests: --verify first, since it decides the pick, then the audit in whatever is
+ * left of the same time budget.
+ */
+async function sendProbes(report: Report, { options, auth }: Context): Promise<Report> {
+  const n = options.auditFallback;
+  if (report.error || !auth || (!options.verify && n === undefined)) return report;
+  const deadline = Date.now() + VERIFY_BUDGET_MS;
+  const verification =
+    options.verify && report.ranked.length
+      ? await verify(report.slug, report.ranked, report.endpoints, auth, deadline)
+      : undefined;
+  const audit = n === undefined ? undefined : await auditFallback(report.slug, n, report.endpoints, auth, deadline);
+  return { ...report, ...(verification && { verification }), ...(audit && { audit }) };
+}
+
+/** The most `n` unpinned requests can cost: default routing may choose any endpoint, so take the highest prices. */
+function auditWorstCase(endpoints: readonly Endpoint[], n: number): number {
+  const highest = (rates: (string | null | undefined)[]) => Math.max(0, ...rates.map((rate) => perMillion(rate) ?? 0));
+  const perRequest =
+    AUDIT_PROMPT_TOKENS * highest(endpoints.map((ep) => ep.pricing.prompt)) +
+    PROBE_MAX_TOKENS * highest(endpoints.map((ep) => ep.pricing.completion));
+  return (n * perRequest) / 1_000_000;
 }
 
 const pickOf = (report: Report): Endpoint | undefined =>
@@ -408,7 +454,51 @@ function renderReport(report: Report, ctx: Context): string {
       lines.push(`    ${endpoint.tag.padEnd(width)}  zdr ${zdr}  ${reasons.join("; ")}`);
     }
   }
+  if (report.audit) lines.push(...renderAudit(report.audit));
   return lines.join("\n");
+}
+
+/** Dollars to the cent, or to a hundredth of a cent below ten cents. */
+const fmtUsd = (usd: number): string => `$${usd.toFixed(usd >= 0.1 ? 2 : 4)}`;
+
+/** One row per provider and tier that served, most served first, with failed requests in one last row. */
+function renderAudit({ samples, unsent, usd }: Audit): string[] {
+  const lines = [
+    `  audit: ${samples.length} unpinned requests, OpenRouter default routing; ` +
+      "-p/-e/-x/--zdr not applied, account settings apply",
+  ];
+  const groups = new Map<
+    string,
+    { provider: string | null; tier: string | null; quant: string | null; served: number; invalid: number }
+  >();
+  for (const { provider, serviceTier, quantization, toolCallValid } of samples) {
+    const key = JSON.stringify([provider, serviceTier]);
+    const group = groups.get(key) ?? { provider, tier: serviceTier, quant: quantization, served: 0, invalid: 0 };
+    group.served += 1;
+    if (!toolCallValid) group.invalid += 1;
+    groups.set(key, group);
+  }
+  const rows = [...groups.values()]
+    .sort(
+      (a, b) =>
+        Number(a.provider === null) - Number(b.provider === null) ||
+        b.served - a.served ||
+        (a.provider ?? "").localeCompare(b.provider ?? "") ||
+        (a.tier ?? "").localeCompare(b.tier ?? ""),
+    )
+    .map(({ provider, tier, quant, served, invalid }) => [
+      provider ?? "(no response)",
+      String(served),
+      `${Math.round((100 * served) / samples.length)}%`,
+      String(invalid),
+      provider === null ? "" : (quant ?? "?"),
+      provider === null ? "" : dash(tier ?? undefined),
+    ]);
+  if (rows.length) {
+    lines.push(...table(["provider", "served", "share", "invalid", "quant", "tier"], rows, new Set([1, 2, 3])));
+  }
+  lines.push(`  audit: ${fmtUsd(usd)} spent, ${unsent} unsent`);
+  return lines;
 }
 
 function reportJson(report: Report, ctx: Context) {
@@ -472,6 +562,9 @@ function reportJson(report: Report, ctx: Context) {
       })),
       notProbed: report.verification.unprobed ?? 0,
     }),
+    audit: report.audit?.samples ?? null,
+    auditUnsent: report.audit?.unsent ?? null,
+    auditUsd: report.audit ? Number(report.audit.usd.toFixed(8)) : null,
   };
 }
 
@@ -493,6 +586,10 @@ export async function main(argv: string[]): Promise<number> {
   const auth = resolveAuth();
   if (options.verify && !auth) {
     console.error(`${NAME}: --verify sends real requests and needs an API key; set OPENROUTER_API_KEY`);
+    return 2;
+  }
+  if (options.auditFallback !== undefined && !auth) {
+    console.error(`${NAME}: --audit-fallback sends real requests and needs an API key; set OPENROUTER_API_KEY`);
     return 2;
   }
   if (options.probe.length) {
@@ -539,7 +636,20 @@ export async function main(argv: string[]): Promise<number> {
     locations: locations instanceof Error ? undefined : locations,
     zdr: zdr instanceof Error ? undefined : zdr,
   };
-  const pending = options.slugs.map((slug) => buildReport(slug, ctx));
+  const fetched = options.slugs.map((slug) => buildReport(slug, ctx));
+  const n = options.auditFallback;
+  if (n !== undefined) {
+    // The audit's cost is bounded over every model before any paid request, --verify's included, is sent.
+    const audited = (await Promise.all(fetched)).filter((report) => !report.error);
+    const usd = audited.reduce((sum, report) => sum + auditWorstCase(report.endpoints, n), 0);
+    const estimate = `up to ${fmtUsd(usd)} for ${n * audited.length} requests to ${audited.map(({ slug }) => slug).join(", ")}`;
+    if (usd > AUDIT_MAX_USD) {
+      console.error(`${NAME}: --audit-fallback: ${estimate}, over the ${fmtUsd(AUDIT_MAX_USD)} cap; ask for fewer`);
+      return 2;
+    }
+    if (audited.length) console.error(`${NAME}: --audit-fallback: ${estimate}`);
+  }
+  const pending = fetched.map((next) => next.then((report) => sendProbes(report, ctx)));
   let ok = true;
   if (options.pick) {
     // stdout carries only tags, so `$(opp model --pick)` captures just the answer.
@@ -580,6 +690,10 @@ export async function main(argv: string[]): Promise<number> {
         2,
       ),
     );
+    // A script reading only stdout still sees what the audit spent.
+    for (const { slug, audit } of reports) {
+      if (audit) console.error(`${NAME}: --audit-fallback: ${fmtUsd(audit.usd)} spent on ${slug}`);
+    }
   } else {
     console.log(`# OpenRouter endpoint ranking · ${new Date().toISOString()} · auth: ${auth?.source ?? "anonymous"}`);
     console.log(

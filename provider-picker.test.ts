@@ -67,8 +67,20 @@ describe("parseOptions", () => {
     [[], /at least one model slug/],
     [["together"], /did you mean -p together\?/],
     [["--nope"], /Unknown option/],
+    [["m/x", "--audit-fallback"], /argument missing/],
+    [["m/x", "--audit-fallback", "0"], /whole number from 1 to 50/],
+    [["m/x", "--audit-fallback", "51"], /whole number from 1 to 50/],
+    [["m/x", "--audit-fallback", "2.5"], /whole number from 1 to 50/],
+    [["m/x", "--audit-fallback", "abc"], /whole number from 1 to 50/],
+    [["m/x", "--audit-fallback", "5", "--pick"], /can't be combined with --pick/],
+    [["m/x", "--audit-fallback", "5", "--probe", "a"], /--probe can't be combined/],
   ])("rejects %j", (argv, message) => {
     expect(() => parseOptions(argv)).toThrow(message);
+  });
+
+  test("--audit-fallback takes a request count", () => {
+    expect(parseOptions(["m/x", "--audit-fallback", "50"]).auditFallback).toBe(50);
+    expect(parseOptions(["m/x"])).not.toHaveProperty("auditFallback");
   });
 });
 
@@ -128,6 +140,10 @@ describe("main", () => {
     try {
       expect(await main(["--bogus"])).toBe(2);
       expect(await main([])).toBe(2);
+      for (const value of [[], ["0"], ["51"], ["2.5"], ["abc"]]) {
+        expect(await main(["m/x", "--audit-fallback", ...value])).toBe(2);
+      }
+      expect(await main(["m/x", "--audit-fallback", "5", "--pick"])).toBe(2);
       expect(await main(["--help"])).toBe(0);
       const help = String(log.mock.calls[0]?.[0]);
       const headings = ["Models:", "Eligibility:", "Probes (paid requests)", "Output:", "Auth:", "Exit status:"];
@@ -136,6 +152,7 @@ describe("main", () => {
       expect(at).toEqual([...at].sort((a, b) => a - b));
       expect(help.slice(at[1], at[2])).toContain("--exclude-country");
       expect(help.slice(at[2], at[3])).toContain("--probe");
+      expect(help.slice(at[2], at[3])).toContain("--audit-fallback <n>");
     } finally {
       error.mockRestore();
       log.mockRestore();
@@ -179,21 +196,22 @@ describe("end to end against a mocked OpenRouter", () => {
     ],
   };
 
-  /**
-   * Runs main against a fake OpenRouter whose router answers each pinned probe
-   * as `servedBy(tag)`: a provider name, a raw Response, or no provider.
-   */
   /** A successful probe reply: the forced call to the probe's tool. */
   const TOOL_CALL = {
     finish_reason: "tool_calls",
     message: { tool_calls: [{ type: "function", function: { name: "ok", arguments: "{}" } }] },
   };
 
+  /**
+   * Runs main against a fake OpenRouter whose router answers each pinned probe
+   * as `servedBy(tag)`: a provider name, a raw Response, or no provider. An
+   * unpinned request has no tag. A null key leaves the run with no key at all.
+   */
   async function run(
-    servedBy: (tag: string) => string | Response | undefined,
+    servedBy: (tag: string | undefined) => string | Response | undefined,
     argv = ["m/x", "--verify"],
     zdrList: unknown = ZDR_LIST,
-    { list = endpoints, providers = [] as unknown[] } = {},
+    { list = endpoints, providers = [] as unknown[], key = KEY as string | null } = {},
   ) {
     const calls: { url: string; init: RequestInit }[] = [];
     const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
@@ -208,7 +226,7 @@ describe("end to end against a mocked OpenRouter", () => {
         await Bun.sleep(10); // m/x answers after n/y, so output order can't follow arrival order
         return json({ data: { endpoints: list } });
       }
-      const served = servedBy(JSON.parse(String(init.body)).provider.only[0]);
+      const served = servedBy(JSON.parse(String(init.body)).provider?.only[0]);
       if (served instanceof Response) return served;
       return json({
         ...(served && { provider: served }),
@@ -217,8 +235,13 @@ describe("end to end against a mocked OpenRouter", () => {
     }) as unknown as typeof fetch);
     const log = spyOn(console, "log").mockImplementation(() => {});
     const error = spyOn(console, "error").mockImplementation(() => {});
-    const saved = process.env.OPENROUTER_API_KEY;
-    process.env.OPENROUTER_API_KEY = KEY;
+    const saved = { key: process.env.OPENROUTER_API_KEY, home: process.env.HOME, xdg: process.env.XDG_DATA_HOME };
+    if (key === null) {
+      // No opencode credential store either.
+      delete process.env.OPENROUTER_API_KEY;
+      process.env.HOME = "/nonexistent";
+      delete process.env.XDG_DATA_HOME;
+    } else process.env.OPENROUTER_API_KEY = key;
     try {
       const code = await main(argv);
       const stdout = log.mock.calls.flat().join("\n");
@@ -229,8 +252,14 @@ describe("end to end against a mocked OpenRouter", () => {
         .map(({ init }) => JSON.parse(String(init.body)));
       return { code, stdout, stderr, output, calls, probes };
     } finally {
-      if (saved === undefined) delete process.env.OPENROUTER_API_KEY;
-      else process.env.OPENROUTER_API_KEY = saved;
+      for (const [name, value] of [
+        ["OPENROUTER_API_KEY", saved.key],
+        ["HOME", saved.home],
+        ["XDG_DATA_HOME", saved.xdg],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
       fetchMock.mockRestore();
       log.mockRestore();
       error.mockRestore();
@@ -586,6 +615,145 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(models[0].ineligible).toEqual([
       { endpoint: "broken", provider: "broken", zdr: true, reasons: ["status -2"] },
     ]);
+  });
+
+  describe("--audit-fallback", () => {
+    /** An unpinned reply from `provider` with an ok tool call carrying `args`. */
+    const served =
+      (provider: string, { args = "{}", cost = 0.001, tier }: { args?: string; cost?: number; tier?: string } = {}) =>
+      () =>
+        new Response(
+          JSON.stringify({
+            provider,
+            ...(tier && { service_tier: tier }),
+            usage: { cost },
+            choices: [
+              { finish_reason: "tool_calls", message: { tool_calls: [{ function: { name: "ok", arguments: args } }] } },
+            ],
+          }),
+        );
+    const limited = () =>
+      new Response(JSON.stringify({ error: { message: "Rate limited", code: 429 } }), { status: 429 });
+    /** Pinned probes are served by their own provider; unpinned requests get `replies` in turn. */
+    const routing = (replies: (() => Response)[]) => {
+      let next = 0;
+      return (tag: string | undefined) =>
+        tag === undefined
+          ? replies[next++ % replies.length]!()
+          : tag.split("/")[0] === "together"
+            ? "Together"
+            : "Wafer";
+    };
+    const mixed = () =>
+      routing([served("Together"), served("Wafer"), served("Together"), served("Wafer", { args: "[]" }), limited]);
+
+    test("sends unpinned requests that force a tool call", async () => {
+      const { probes } = await run(mixed(), ["m/x", "--audit-fallback", "2"]);
+      expect(probes).toHaveLength(2);
+      for (const body of probes) {
+        expect(body).not.toHaveProperty("provider");
+        expect(body).toMatchObject({ model: "m/x", tool_choice: "required", tools: [{ function: { name: "ok" } }] });
+      }
+    });
+
+    test("counts served, share and unusable tool calls per provider, with failures in one row", async () => {
+      const { stdout, stderr, code } = await run(mixed(), ["m/x", "--audit-fallback", "5"]);
+      expect(code).toBe(0);
+      expect(stderr).toContain("opp: --audit-fallback: up to $0.0112 for 5 requests to m/x");
+      expect(stdout).toContain("audit: 5 unpinned requests, OpenRouter default routing; -p/-e/-x/--zdr not applied");
+      const rows = stdout.split("\n").filter((line) => /^ {2}(Together|Wafer|\(no response\)) /.test(line));
+      expect(rows.map((row) => row.trim().split(/ {2,}/))).toEqual([
+        ["Together", "2", "40%", "0", "?", "-"],
+        ["Wafer", "2", "40%", "1", "?", "-"],
+        ["(no response)", "1", "20%", "1"],
+      ]);
+      expect(stdout).toContain("audit: $0.0040 spent, 0 unsent");
+      const json = await run(mixed(), ["m/x", "--audit-fallback", "5", "--json"]);
+      const model = JSON.parse(json.stdout).models[0];
+      expect(model.audit.map(({ ms: _, ...rest }: { ms: number }) => rest)).toEqual([
+        { provider: "Together", quantization: null, serviceTier: null, toolCallValid: true },
+        { provider: "Wafer", quantization: null, serviceTier: null, toolCallValid: true },
+        { provider: "Together", quantization: null, serviceTier: null, toolCallValid: true },
+        { provider: "Wafer", quantization: null, serviceTier: null, toolCallValid: false },
+        { provider: null, quantization: null, serviceTier: null, toolCallValid: false },
+      ]);
+      expect(model.auditUnsent).toBe(0);
+      expect(model.auditUsd).toBe(0.004);
+    });
+
+    test("quantization resolves from one matching endpoint and is null when matching endpoints differ", async () => {
+      const list = [
+        ep("together/fp8", { provider_name: "Together", quantization: "fp8" }),
+        ep("wafer/fp8", { provider_name: "Wafer", quantization: "fp8" }),
+        ep("wafer/bf16", { provider_name: "Wafer", quantization: "bf16" }),
+        ep("wafer/flex", { provider_name: "Wafer", quantization: "fp4", service_tier: "flex" }),
+      ];
+      const replies = routing([served("together"), served("Wafer"), served("Wafer", { tier: "flex" })]);
+      const { stdout } = await run(replies, ["m/x", "--audit-fallback", "3", "--json"], ZDR_LIST, { list });
+      expect(JSON.parse(stdout).models[0].audit.map((s: { quantization: unknown }) => s.quantization)).toEqual([
+        "fp8",
+        null,
+        "fp4",
+      ]);
+    });
+
+    test("-p and --zdr don't change the requests", async () => {
+      const plain = await run(mixed(), ["m/x", "--audit-fallback", "3"]);
+      const filtered = await run(mixed(), ["m/x", "--audit-fallback", "3", "-p", "wafer", "--zdr"]);
+      expect(filtered.probes).toEqual(plain.probes);
+    });
+
+    test("the pick and exit status are the same with and without the audit", async () => {
+      for (const servedBy of [() => "Wafer", () => undefined]) {
+        const without = await run(servedBy, ["m/x", "--verify", "--json"]);
+        const withAudit = await run(servedBy, ["m/x", "--verify", "--json", "--audit-fallback", "2"]);
+        expect(withAudit.code).toBe(without.code);
+        expect(JSON.parse(withAudit.stdout).models[0].pick).toEqual(JSON.parse(without.stdout).models[0].pick);
+        expect(JSON.parse(withAudit.stdout).models[0].audit).toHaveLength(2);
+      }
+      const plain = await run(() => "Together", ["m/x", "--json"]);
+      expect(plain.code).toBe(0);
+      const { models } = JSON.parse(plain.stdout);
+      expect([models[0].audit, models[0].auditUnsent, models[0].auditUsd]).toEqual([null, null, null]);
+    });
+
+    test("requests not sent by the deadline are counted as unsent", async () => {
+      let now = 0;
+      const clock = spyOn(Date, "now").mockImplementation(() => (now += 100_000)); // 100s per reading
+      try {
+        const { stdout, probes } = await run(mixed(), ["m/x", "--audit-fallback", "5", "--json"]);
+        const model = JSON.parse(stdout).models[0];
+        expect(probes).toHaveLength(1);
+        expect(model.audit).toHaveLength(1);
+        expect(model.auditUnsent).toBe(4);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    test("under --json the spend goes to stderr and stdout stays valid JSON", async () => {
+      const { stdout, stderr } = await run(mixed(), ["m/x", "--audit-fallback", "2", "--json"]);
+      expect(JSON.parse(stdout).models[0].auditUsd).toBe(0.002);
+      expect(stderr).toContain("opp: --audit-fallback: $0.0020 spent on m/x");
+    });
+
+    test("no key exits 2 and sends no chat request", async () => {
+      const { code, probes, stderr } = await run(mixed(), ["m/x", "--audit-fallback", "2"], ZDR_LIST, { key: null });
+      expect(code).toBe(2);
+      expect(probes).toHaveLength(0);
+      expect(stderr).toContain("--audit-fallback sends real requests and needs an API key");
+    });
+
+    test("a worst case over the cap exits 2 before any request, --verify's included", async () => {
+      // $100/M in and out: 50 requests can cost 50 × (200 + 512) × $0.0001 = $3.56.
+      const list = [ep("pricey", { pricing: { prompt: "0.0001", completion: "0.0001" } }), ...endpoints];
+      const { code, probes, stderr } = await run(mixed(), ["m/x", "--verify", "--audit-fallback", "50"], ZDR_LIST, {
+        list,
+      });
+      expect(code).toBe(2);
+      expect(probes).toHaveLength(0);
+      expect(stderr).toContain("up to $3.56 for 50 requests to m/x, over the $0.50 cap");
+    });
   });
 });
 

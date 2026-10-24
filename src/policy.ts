@@ -38,6 +38,10 @@ export const QUANT_ORDER: readonly (readonly string[])[] = [
   ["fp6", "fp8", "int8"],
   ["bf16", "fp16", "fp32"],
 ];
+/** --audit-fallback's prompt tokens per request when bounding its cost. A measured request used 137. */
+export const AUDIT_PROMPT_TOKENS = 200;
+/** --audit-fallback refuses to start when its worst case over every model exceeds this many dollars. */
+export const AUDIT_MAX_USD = 0.5;
 
 export type ToolChoiceMode = (typeof TOOL_CHOICE_MODES)[number];
 type Percentiles = { p50?: number | null; p75?: number | null; p90?: number | null; p99?: number | null };
@@ -74,6 +78,16 @@ export type Auth = { key: string; source: string };
 export type Probe = { endpoint: Endpoint; ok: boolean; busy: boolean; detail: string };
 /** `unprobed` counts the candidates left untried when the time budget ran out. */
 export type Verification = { probes: Probe[]; verified?: Endpoint; unprobed?: number };
+/** One unpinned request's outcome under OpenRouter's default routing. A null provider means no response. */
+export type AuditSample = {
+  provider: string | null;
+  quantization: string | null;
+  serviceTier: string | null;
+  toolCallValid: boolean;
+  ms: number;
+};
+/** `unsent` counts the requests left when the time budget ran out; `usd` sums the responses' usage.cost. */
+export type Audit = { samples: AuditSample[]; unsent: number; usd: number };
 export type Report = {
   slug: string;
   error?: string;
@@ -84,6 +98,7 @@ export type Report = {
   ranked: Ranked[];
   ineligible: { endpoint: Endpoint; reasons: string[] }[];
   verification?: Verification;
+  audit?: Audit;
 };
 export type Options = {
   slugs: string[];
@@ -96,6 +111,8 @@ export type Options = {
   json: boolean;
   pick: boolean;
   help: boolean;
+  /** Unpinned requests to send per model with --audit-fallback. */
+  auditFallback?: number;
 };
 
 export function ineligibleReasons(ep: Endpoint): string[] {
