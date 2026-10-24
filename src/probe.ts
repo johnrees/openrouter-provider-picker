@@ -56,8 +56,18 @@ const usableCall = (c: unknown): boolean => {
   return fn?.name === PROBE_TOOL && isArgumentObject(fn.arguments);
 };
 
-/** One probe request's outcome. `retryInMs` is set when the failure is transient. */
-type Attempt = { ok: boolean; detail: string; retryInMs?: number };
+/**
+ * One probe request's outcome. `retryInMs` is set when the failure is transient
+ * and worth retrying. `timedOut` marks a request that got no reply in time:
+ * transient too, but a retry could hang as long again. `judged` marks a
+ * verdict on the endpoint's tool_choice support, read from a reply the
+ * endpoint finished. Anything else (no reply, an HTTP error, a reply from the
+ * wrong endpoint, or one cut off by the token budget) says nothing about
+ * support, apart from a tool call under tool_choice none.
+ */
+type Attempt = { ok: boolean; detail: string; retryInMs?: number; timedOut?: boolean; judged?: boolean };
+
+const isTimeout = (error: unknown): boolean => error instanceof Error && error.name === "TimeoutError";
 
 /** The tool_choice request value for each mode; the named function is the probe's own tool. */
 export function toolChoiceFor(mode: ToolChoiceMode) {
@@ -146,11 +156,28 @@ export async function probe(
   mode: ToolChoiceMode = "required",
 ): Promise<Probe> {
   const first = await attempt(slug, ep, endpoints, auth, mode);
-  if (first.retryInMs === undefined) return { endpoint: ep, ok: first.ok, busy: false, detail: first.detail };
+  if (first.retryInMs === undefined) {
+    const busy = first.timedOut === true;
+    return {
+      endpoint: ep,
+      ok: first.ok,
+      busy,
+      conclusive: !busy && first.judged === true,
+      detail: first.detail,
+      at: new Date().toISOString(),
+    };
+  }
   await new Promise((resolve) => setTimeout(resolve, first.retryInMs));
   const second = await attempt(slug, ep, endpoints, auth, mode);
-  const busy = second.retryInMs !== undefined;
-  return { endpoint: ep, ok: second.ok, busy, detail: `${second.detail}, ${second.ok ? "after a retry" : "retried"}` };
+  const busy = second.retryInMs !== undefined || second.timedOut === true;
+  return {
+    endpoint: ep,
+    ok: second.ok,
+    busy,
+    conclusive: !busy && second.judged === true,
+    at: new Date().toISOString(),
+    detail: `${second.detail}, ${second.ok ? "after a retry" : "retried"}`,
+  };
 }
 
 async function attempt(
@@ -165,6 +192,7 @@ async function attempt(
     detail: sanitize(detail, auth.key),
     ...(retryInMs !== undefined && { retryInMs }),
   });
+  const verdict = (ok: boolean, detail: string): Attempt => ({ ...result(ok, detail), judged: true });
   try {
     const res = await fetch(`${API}/chat/completions`, {
       method: "POST",
@@ -173,12 +201,21 @@ async function attempt(
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       body: JSON.stringify(probeBody(slug, ep, endpoints, mode)),
     });
-    const body = (await res.json().catch(() => null)) as ChatResponse | null;
+    // A body that is not JSON is judged below. A failure while reading it, such as a timeout or a reset, is no reply.
+    const text = await res.text();
+    const body = ((): ChatResponse | null => {
+      try {
+        return JSON.parse(text) as ChatResponse | null;
+      } catch {
+        return null;
+      }
+    })();
     const upstream = body?.error?.message;
     if (!res.ok || upstream != null) {
       // OpenRouter can also report an upstream rate limit as an error body on a 200.
       const status = res.ok ? Number(body?.error?.code) : res.status;
       const retryInMs = TRANSIENT_STATUSES.has(status) ? retryDelay(res.headers.get("retry-after")) : undefined;
+      // An error can come from the account, routing or the request as a whole, so it is no verdict on tool_choice.
       return result(false, `HTTP ${status || res.status}${upstream == null ? "" : ` ${String(upstream)}`}`, retryInMs);
     }
     // Pinning makes this unreachable unless OpenRouter changes semantics. Check anyway, since verifying is the point.
@@ -189,11 +226,17 @@ async function attempt(
     const want = ep.service_tier ?? "default";
     if (typeof tier === "string" && tier !== want) return result(false, `served at tier ${tier}, expected ${want}`);
     const problem = toolCallProblem(body, mode);
-    if (problem !== undefined) return result(false, problem);
     const finish = String(body?.choices?.[0]?.finish_reason ?? "none");
-    return result(true, `served by ${servedBy}${mode === "none" ? ", no tool call" : ""}, finish=${finish}`);
+    const ok = problem === undefined;
+    const detail = problem ?? `served by ${servedBy}${mode === "none" ? ", no tool call" : ""}, finish=${finish}`;
+    // An unfinished, errored or filtered reply says nothing about tool_choice support, and nor does one cut off
+    // by the token budget, except for a tool call under none. Those fail or pass for this run but are not stored.
+    const unfinished = problem?.startsWith("no finished completion") === true;
+    const cutOff = finish === "length" && (ok || mode !== "none");
+    return (unfinished || cutOff ? result : verdict)(ok, detail);
   } catch (error) {
-    return result(false, errorMessage(error));
+    // No reply at all, from a timeout, reset or DNS failure, is no evidence about the endpoint.
+    return { ...result(false, errorMessage(error)), ...(isTimeout(error) && { timedOut: true }) };
   }
 }
 

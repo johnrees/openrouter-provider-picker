@@ -13,7 +13,7 @@
  *
  * README.md explains the policy. Run with --help for usage. This file is the
  * Bun command line; src/policy.ts ranks, src/openrouter.ts fetches and
- * src/probe.ts sends the paid test requests.
+ * src/probe.ts sends the paid test requests, whose results src/probe-store.ts keeps.
  */
 
 import { Database } from "bun:sqlite";
@@ -27,7 +27,9 @@ import {
   type Auth,
   COUNTRY,
   type Endpoint,
+  freshProbes,
   ineligibleReasons,
+  listedToolChoice,
   type Location,
   locationReasons,
   matchesProvider,
@@ -36,17 +38,23 @@ import {
   PRICE_ELIM_DELTA_USD,
   PRICE_ELIM_RATIO,
   perMillion,
+  PROBE_TTL_DAYS,
+  type Probed,
+  type ProbeStore,
   pinRouting,
+  probeOverrides,
   providerSlug,
   REFERENCE_RUN,
   type Report,
   rank,
   TOOL_CHOICE_MODES,
   TURN_OUTPUT_TOKENS,
+  toolChoiceSource,
   turnMs,
   UPTIME_SATURATION,
 } from "./src/policy.ts";
 import { auditFallback, PROBE_MAX_TOKENS, probe, VERIFY_BUDGET_MS, verify } from "./src/probe.ts";
+import { loadProbes, probeStorePath, recordProbes } from "./src/probe-store.ts";
 
 /** The command name, as installed by package.json "bin". */
 const NAME = "opp";
@@ -94,6 +102,11 @@ Probes (paid requests):
                                 --zdr don't apply. Shows the worst-case cost first
                                 and refuses over $${AUDIT_MAX_USD.toFixed(2)}; stops sending once the
                                 spend reaches it. Never changes the pick.
+  Probe results from the last ${PROBE_TTL_DAYS} days override the listed tool_choice
+  support for that endpoint and mode, either way. Only a verdict on a reply
+  the endpoint finished is kept: not an error, nor a busy, misrouted or cut-off
+  probe. They are stored in $XDG_CACHE_HOME/opp/probes.json; delete it to
+  clear them.
 
 Output:
       --json                    Print machine-readable results
@@ -209,7 +222,16 @@ export function resolveAuth(env: Record<string, string | undefined> = process.en
 
 // ---- Reports ----------------------------------------------------------------
 
-/** Sends all four tool_choice modes to each named endpoint and prints a line per tag and mode. */
+/** Prints a warning when probe results could not be stored. */
+function storeProbes(slug: string, results: Parameters<typeof recordProbes>[2]): void {
+  const error = recordProbes(probeStorePath(), slug, results);
+  if (error) console.error(`${NAME}: could not store probe results: ${error}`);
+}
+
+/**
+ * Sends all four tool_choice modes to each named endpoint, prints a line per
+ * tag and mode, and stores the results.
+ */
 async function probeTags(slug: string, tags: readonly string[], auth: Auth): Promise<boolean> {
   let ok = true;
   let endpoints: Endpoint[];
@@ -229,9 +251,10 @@ async function probeTags(slug: string, tags: readonly string[], auth: Auth): Pro
     for (const mode of TOOL_CHOICE_MODES) {
       const outcome = await probe(slug, found, endpoints, auth, mode);
       ok &&= outcome.ok;
-      const listed = found.supports_tool_choice?.[mode] === true ? "yes" : "no";
+      const listed = listedToolChoice(found, mode) ? "yes" : "no";
       const status = outcome.ok ? "ok" : outcome.busy ? "busy" : "fail";
       console.log(`${found.tag}  ${mode}  ${status}  listed: ${listed}  ${outcome.detail}`);
+      storeProbes(slug, [{ probe: outcome, mode }]);
     }
   }
   return ok;
@@ -244,6 +267,9 @@ type Context = {
   locations?: Map<string, Location>;
   zdr?: Set<string>;
   auditBudget?: { usd: number };
+  /** Stored probe results, read once at the start of the run. */
+  probes: ProbeStore;
+  now: Date;
 };
 
 const locationOf = (ep: Endpoint, { locations }: Context): Location | undefined => locations?.get(providerSlug(ep));
@@ -267,12 +293,19 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
     // ranking and can't set the price guard's baseline. The provider filter is
     // only a view: it applies after ranking so the guard still compares against
     // the whole tier.
-    const ranked = rank(endpoints.filter((ep) => !excludedBy(ep).length)).filter(({ endpoint }) => kept(endpoint));
+    const probed = freshProbes(ctx.probes, slug, ctx.now.getTime());
+    const ranked = rank(
+      endpoints.filter((ep) => !excludedBy(ep).length),
+      probed,
+    ).filter(({ endpoint }) => kept(endpoint));
     const ineligible = endpoints
       .filter(kept)
-      .map((endpoint) => ({ endpoint, reasons: [...ineligibleReasons(endpoint), ...excludedBy(endpoint)] }))
+      .map((endpoint) => ({
+        endpoint,
+        reasons: [...ineligibleReasons(endpoint, probed.get(endpoint.tag)), ...excludedBy(endpoint)],
+      }))
       .filter(({ reasons }) => reasons.length);
-    return { slug, total: endpoints.length, malformed, endpoints, ranked, ineligible };
+    return { slug, total: endpoints.length, malformed, endpoints, ranked, ineligible, probed };
   } catch (error) {
     return {
       slug,
@@ -282,6 +315,7 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
       endpoints: [],
       ranked: [],
       ineligible: [],
+      probed: new Map(),
     };
   }
 }
@@ -298,6 +332,13 @@ async function sendProbes(report: Report, { options, auth, auditBudget }: Contex
     options.verify && report.ranked.length
       ? await verify(report.slug, report.ranked, report.endpoints, auth, deadline)
       : undefined;
+  // --verify probes in the default mode, required, through each candidate's pin. The audit is unpinned, so it
+  // says nothing about any one endpoint and is never stored.
+  if (verification)
+    storeProbes(
+      report.slug,
+      verification.probes.map((probe) => ({ probe, mode: "required" as const })),
+    );
   const audit =
     n === undefined ? undefined : await auditFallback(report.slug, n, report.endpoints, auth, deadline, auditBudget);
   return { ...report, ...(verification && { verification }), ...(audit && { audit }) };
@@ -350,6 +391,19 @@ function busyNote(report: Report): string {
   const busy = report.verification?.probes.filter(({ busy }) => busy).map(({ endpoint }) => endpoint.tag) ?? [];
   return busy.length ? `${busy.join(", ")} ${busy.length === 1 ? "was" : "were"} busy; re-run to retry` : "";
 }
+
+/** Notes the modes a fresh probe passed although the listing lacks them; "" when there are none. */
+function probeNote(ep: Endpoint, probed: Probed | undefined): string {
+  const { pass } = probeOverrides(ep, probed);
+  return pass.length ? `probed: ${pass.join("/")} pass (listed no)` : "";
+}
+
+/** Whether a probe result contradicted the listing for any endpoint the report shows. */
+const probeOverrode = (report: Report): boolean =>
+  [...report.ranked, ...report.ineligible].some(({ endpoint }) => {
+    const { pass, fail } = probeOverrides(endpoint, report.probed.get(endpoint.tag));
+    return pass.length + fail.length > 0;
+  });
 
 // ---- Rendering --------------------------------------------------------------
 
@@ -452,7 +506,7 @@ function renderReport(report: Report, ctx: Context): string {
       yesNo(ep, "structured_outputs"),
       yesNo(ep, "reasoning"),
       yesNo(ep, "reasoning_effort"),
-      priceEliminated ? "price-elim" : "",
+      [priceEliminated ? "price-elim" : "", probeNote(ep, report.probed.get(ep.tag))].filter(Boolean).join("; "),
     ]);
     lines.push(...table(header, rows, new Set([1, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])));
   } else {
@@ -478,7 +532,11 @@ function renderReport(report: Report, ctx: Context): string {
     const width = Math.max(...report.ineligible.map(({ endpoint }) => endpoint.tag.length));
     for (const { endpoint, reasons } of report.ineligible) {
       const zdr = fmtZdr(zdrOf(endpoint, report.slug, ctx));
-      lines.push(`    ${endpoint.tag.padEnd(width)}  zdr ${zdr}  ${reasons.join("; ")}`);
+      const listedYes = probeOverrides(endpoint, report.probed.get(endpoint.tag)).fail;
+      const shown = reasons.map((reason) =>
+        reason.startsWith("probed: ") && listedYes.length ? `${reason} (listed yes: ${listedYes.join("/")})` : reason,
+      );
+      lines.push(`    ${endpoint.tag.padEnd(width)}  zdr ${zdr}  ${shown.join("; ")}`);
     }
   }
   if (report.audit) lines.push(...renderAudit(report.audit));
@@ -577,6 +635,7 @@ function reportJson(report: Report, ctx: Context) {
         structuredOutputs: ep.supported_parameters.includes("structured_outputs"),
         reasoning: ep.supported_parameters.includes("reasoning"),
         reasoningEffort: ep.supported_parameters.includes("reasoning_effort"),
+        toolChoiceSource: toolChoiceSource(report.probed.get(ep.tag)),
       };
     }),
     ineligible: report.ineligible.map(({ endpoint, reasons }) => ({
@@ -584,6 +643,7 @@ function reportJson(report: Report, ctx: Context) {
       provider: endpoint.provider_name,
       zdr: zdrOf(endpoint, report.slug, ctx) ?? null,
       reasons,
+      toolChoiceSource: toolChoiceSource(report.probed.get(endpoint.tag)),
     })),
     ...(report.verification && {
       probes: report.verification.probes.map(({ endpoint, ok, busy, detail }) => ({
@@ -669,6 +729,8 @@ export async function main(argv: string[]): Promise<number> {
     auth,
     locations: locations instanceof Error ? undefined : locations,
     zdr: zdr instanceof Error ? undefined : zdr,
+    probes: loadProbes(probeStorePath()),
+    now: new Date(),
   };
   const fetched = options.slugs.map((slug) => buildReport(slug, ctx));
   const n = options.auditFallback;
@@ -737,9 +799,12 @@ export async function main(argv: string[]): Promise<number> {
       if (audit) console.error(`${NAME}: --audit-fallback: ${spent(audit, ` on ${slug}`)}`);
     }
   } else {
+    // The eligibility line says whether a probe overrode a listing, so it waits for every report.
+    const reports = await Promise.all(pending);
     console.log(`# OpenRouter endpoint ranking · ${new Date().toISOString()} · auth: ${auth?.source ?? "anonymous"}`);
     console.log(
       `# eligible: native tools, status 0, tool_choice ${TOOL_CHOICE_MODES.join("/")}` +
+        (reports.some(probeOverrode) ? ", probe results override listings" : "") +
         (options.excludeProviders.length ? `, excluding ${options.excludeProviders.join(", ")}` : "") +
         (options.excludeCountries.length ? `, not in ${options.excludeCountries.join("/")}` : "") +
         (options.zdr ? ", ZDR only" : ""),
@@ -756,8 +821,7 @@ export async function main(argv: string[]): Promise<number> {
       `# prices: USD per million tokens; $run = ${REFERENCE_RUN.prompt / 1000}k in + ` +
         `${REFERENCE_RUN.cacheRead / 1_000_000}M cache read + ${REFERENCE_RUN.completion / 1000}k out`,
     );
-    for (const next of pending) {
-      const report = await next;
+    for (const report of reports) {
       ok &&= pickOf(report) !== undefined;
       console.log(renderReport(report, ctx));
     }

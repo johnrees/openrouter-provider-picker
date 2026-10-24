@@ -27,6 +27,8 @@ export const PRICE_ELIM_DELTA_USD = 1;
 export const REFERENCE_RUN = { prompt: 500_000, cacheRead: 15_000_000, completion: 30_000 } as const;
 /** An endpoint missing any of these silently degrades agent loops, so it is ineligible. */
 export const TOOL_CHOICE_MODES = ["none", "auto", "required", "function"] as const;
+/** A probe result older than this is ignored, and the listing decides that mode again. */
+export const PROBE_TTL_DAYS = 7;
 export const COUNTRY = /^[A-Z]{2}$/;
 /**
  * Quantizations from lowest to highest precision; values in one group rank
@@ -44,6 +46,11 @@ export const AUDIT_PROMPT_TOKENS = 200;
 export const AUDIT_MAX_USD = 0.5;
 
 export type ToolChoiceMode = (typeof TOOL_CHOICE_MODES)[number];
+export type ProbeResult = { result: "pass" | "fail"; at: string };
+/** Stored probe results: model slug, then endpoint tag, then mode. */
+export type ProbeStore = Record<string, Record<string, Partial<Record<ToolChoiceMode, ProbeResult>>>>;
+/** One endpoint's fresh probe results by mode. */
+export type Probed = Partial<Record<ToolChoiceMode, ProbeResult["result"]>>;
 type Percentiles = { p50?: number | null; p75?: number | null; p90?: number | null; p99?: number | null };
 
 /** The fields this tool reads from an entry of GET /models/{slug}/endpoints. */
@@ -81,8 +88,21 @@ export type Endpoint = {
 export type Location = { headquarters?: string | null; datacenters?: string[] | null };
 export type Ranked = { endpoint: Endpoint; cost: number | undefined; priceEliminated: boolean };
 export type Auth = { key: string; source: string };
-/** `busy` marks a failure that was still transient after one retry: a rate limit or overload, not a dead route. */
-export type Probe = { endpoint: Endpoint; ok: boolean; busy: boolean; detail: string };
+/**
+ * `busy` marks a transient failure, a rate limit, overload or timeout that
+ * still failed after any retry. `conclusive` is true only for a verdict on the
+ * endpoint's tool_choice support (see probe.ts); anything else says nothing
+ * about the endpoint, so it is never stored.
+ */
+export type Probe = {
+  endpoint: Endpoint;
+  ok: boolean;
+  busy: boolean;
+  conclusive: boolean;
+  detail: string;
+  /** When the probe got its answer, as an ISO time. */
+  at: string;
+};
 /** `unprobed` counts the candidates left untried when the time budget ran out. */
 export type Verification = { probes: Probe[]; verified?: Endpoint; unprobed?: number };
 /** One unpinned request's outcome under OpenRouter's default routing. A null provider means no response. */
@@ -109,6 +129,8 @@ export type Report = {
   ineligible: { endpoint: Endpoint; reasons: string[] }[];
   verification?: Verification;
   audit?: Audit;
+  /** Fresh probe results by endpoint tag, which replace the listing's tool_choice support. */
+  probed: ReadonlyMap<string, Probed>;
 };
 export type Options = {
   slugs: string[];
@@ -125,12 +147,53 @@ export type Options = {
   auditFallback?: number;
 };
 
-export function ineligibleReasons(ep: Endpoint): string[] {
+const own = <T>(record: Record<string, T>, key: string): T | undefined =>
+  Object.hasOwn(record, key) ? record[key] : undefined;
+
+/** A model's probe results no older than PROBE_TTL_DAYS at `now` (ms), by endpoint tag. */
+export function freshProbes(store: ProbeStore, slug: string, now: number): Map<string, Probed> {
+  const fresh = new Map<string, Probed>();
+  for (const [tag, modes] of Object.entries(own(store, slug) ?? {})) {
+    const probed: Probed = {};
+    for (const mode of TOOL_CHOICE_MODES) {
+      const entry = own(modes, mode);
+      const age = now - Date.parse(entry?.at ?? "");
+      if (entry && age >= 0 && age <= PROBE_TTL_DAYS * 86_400_000) probed[mode] = entry.result;
+    }
+    if (Object.keys(probed).length) fresh.set(tag, probed);
+  }
+  return fresh;
+}
+
+export const listedToolChoice = (ep: Endpoint, mode: ToolChoiceMode): boolean =>
+  ep.supports_tool_choice?.[mode] === true;
+
+/** Where each mode's support comes from: a fresh probe result replaces the listing. */
+export const toolChoiceSource = (probed: Probed = {}): Record<ToolChoiceMode, "listing" | "probe"> =>
+  Object.fromEntries(
+    TOOL_CHOICE_MODES.map((mode) => [mode, probed[mode] === undefined ? "listing" : "probe"]),
+  ) as Record<ToolChoiceMode, "listing" | "probe">;
+
+/** The modes whose fresh probe result contradicts the listing, by result. */
+export function probeOverrides(ep: Endpoint, probed: Probed = {}): Record<ProbeResult["result"], ToolChoiceMode[]> {
+  return {
+    pass: TOOL_CHOICE_MODES.filter((mode) => probed[mode] === "pass" && !listedToolChoice(ep, mode)),
+    fail: TOOL_CHOICE_MODES.filter((mode) => probed[mode] === "fail" && listedToolChoice(ep, mode)),
+  };
+}
+
+/**
+ * Why an endpoint can't be ranked. A fresh probe result for a tool_choice mode
+ * replaces the listing's value for that mode; every other rule reads the listing.
+ */
+export function ineligibleReasons(ep: Endpoint, probed: Probed = {}): string[] {
   const reasons: string[] = [];
   if ((ep.status ?? 0) !== 0) reasons.push(`status ${ep.status}`);
   if (!ep.supported_parameters.includes("tools")) reasons.push("no native tools");
-  const missing = TOOL_CHOICE_MODES.filter((mode) => ep.supports_tool_choice?.[mode] !== true);
+  const missing = TOOL_CHOICE_MODES.filter((mode) => probed[mode] === undefined && !listedToolChoice(ep, mode));
   if (missing.length) reasons.push(`tool_choice lacks ${missing.join("/")}`);
+  const failed = TOOL_CHOICE_MODES.filter((mode) => probed[mode] === "fail");
+  if (failed.length) reasons.push(`probed: ${failed.join("/")} fail`);
   return reasons;
 }
 
@@ -210,8 +273,8 @@ function compareKeys(a: readonly number[], b: readonly number[]): number {
 }
 
 /** Ranks eligible endpoints best first and drops the ineligible ones. */
-export function rank(endpoints: readonly Endpoint[]): Ranked[] {
-  const eligible = endpoints.filter((ep) => ineligibleReasons(ep).length === 0);
+export function rank(endpoints: readonly Endpoint[], probed: ReadonlyMap<string, Probed> = new Map()): Ranked[] {
+  const eligible = endpoints.filter((ep) => ineligibleReasons(ep, probed.get(ep.tag)).length === 0);
   if (!eligible.length) return [];
 
   // Price guard baseline: the cheapest endpoint in the most reliable tier with

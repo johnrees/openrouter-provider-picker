@@ -1,10 +1,23 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fmtRate, main, parseOptions, resolveAuth } from "./provider-picker.ts";
 import { ep } from "./src/fixtures.ts";
+
+/** A new, empty XDG_CACHE_HOME, so probe results never reach the real store or leak between runs. */
+const freshCache = (): string => mkdtempSync(join(tmpdir(), "opp-cache-"));
+beforeEach(() => {
+  process.env.XDG_CACHE_HOME = freshCache();
+});
+
+/** Writes a probe store into `cache`, as --probe or --verify would have. */
+function seedProbes(cache: string, store: unknown): void {
+  mkdirSync(join(cache, "opp"), { recursive: true });
+  writeFileSync(join(cache, "opp", "probes.json"), JSON.stringify(store));
+}
+const readProbes = (cache: string): unknown => JSON.parse(readFileSync(join(cache, "opp", "probes.json"), "utf8"));
 
 describe("parseOptions", () => {
   test("defaults", () => {
@@ -211,8 +224,9 @@ describe("end to end against a mocked OpenRouter", () => {
     servedBy: (tag: string | undefined) => string | Response | undefined,
     argv = ["m/x", "--verify"],
     zdrList: unknown = ZDR_LIST,
-    { list = endpoints, providers = [] as unknown[], key = KEY as string | null } = {},
+    { list = endpoints, providers = [] as unknown[], key = KEY as string | null, cache = freshCache() } = {},
   ) {
+    process.env.XDG_CACHE_HOME = cache;
     const calls: { url: string; init: RequestInit }[] = [];
     const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
     const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input: unknown, init: RequestInit = {}) => {
@@ -613,7 +627,13 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(text.stdout).toMatch(/broken +zdr Y +status -2/);
     const { models } = JSON.parse((await run(() => undefined, ["m/x", "--json"])).stdout);
     expect(models[0].ineligible).toEqual([
-      { endpoint: "broken", provider: "broken", zdr: true, reasons: ["status -2"] },
+      {
+        endpoint: "broken",
+        provider: "broken",
+        zdr: true,
+        reasons: ["status -2"],
+        toolChoiceSource: { none: "listing", auto: "listing", required: "listing", function: "listing" },
+      },
     ]);
   });
 
@@ -647,9 +667,11 @@ describe("end to end against a mocked OpenRouter", () => {
     const mixed = () =>
       routing([served("Together"), served("Wafer"), served("Together"), served("Wafer", { args: "[]" }), limited]);
 
-    test("sends unpinned requests that force a tool call", async () => {
-      const { probes } = await run(mixed(), ["m/x", "--audit-fallback", "2"]);
+    test("sends unpinned requests that force a tool call, and stores none of them", async () => {
+      const cache = freshCache();
+      const { probes } = await run(mixed(), ["m/x", "--audit-fallback", "2"], ZDR_LIST, { cache });
       expect(probes).toHaveLength(2);
+      expect(existsSync(join(cache, "opp", "probes.json"))).toBe(false);
       for (const body of probes) {
         expect(body).not.toHaveProperty("provider");
         expect(body).toMatchObject({ model: "m/x", tool_choice: "required", tools: [{ function: { name: "ok" } }] });
@@ -848,6 +870,73 @@ describe("end to end against a mocked OpenRouter", () => {
       expect(stderr).toContain("up to $3.56 for 50 requests to m/x, over the $0.50 cap");
     });
   });
+
+  describe("stored probe results", () => {
+    const at = (daysAgo: number) => new Date(Date.now() - daysAgo * 86_400_000).toISOString();
+    // cf is the fastest endpoint, but its listing lacks required.
+    const cf = ep("cf", {
+      provider_name: "Cloudflare",
+      latency_last_30m: { p50: 100 },
+      supports_tool_choice: { none: true, auto: true, required: false, function: true },
+    });
+    const list = [cf, ...endpoints];
+
+    test("a fresh pass makes a listed-no mode eligible, and the endpoint can be picked", async () => {
+      const cache = freshCache();
+      seedProbes(cache, { "m/x": { cf: { required: { result: "pass", at: at(1) } } } });
+      const text = await run(() => undefined, ["m/x"], ZDR_LIST, { list, cache });
+      expect(text.stdout).toContain(
+        "# eligible: native tools, status 0, tool_choice none/auto/required/function, probe results override listings",
+      );
+      expect(text.stdout).toMatch(/▶ +1 +cf .*probed: required pass \(listed no\)/);
+      expect(text.stdout).toContain("pin: m/x:cf");
+      const picked = await run(() => undefined, ["m/x", "--pick"], ZDR_LIST, { list, cache });
+      expect(picked.stdout).toBe("cf");
+      const { models } = JSON.parse((await run(() => undefined, ["m/x", "--json"], ZDR_LIST, { list, cache })).stdout);
+      expect(models[0].ranked[0]).toMatchObject({
+        endpoint: "cf",
+        toolChoiceSource: { none: "listing", auto: "listing", required: "probe", function: "listing" },
+      });
+      expect(models[0].ranked[1].toolChoiceSource.required).toBe("listing");
+    });
+
+    test("a fresh fail makes a listed-yes mode ineligible", async () => {
+      const cache = freshCache();
+      seedProbes(cache, { "m/x": { together: { function: { result: "fail", at: at(0) } } } });
+      const { stdout } = await run(() => undefined, ["m/x"], ZDR_LIST, { cache });
+      expect(stdout).toContain("probe results override listings");
+      expect(stdout).toMatch(/together +zdr - +probed: function fail \(listed yes: function\)/);
+      expect(stdout).toContain("pin: m/x:wafer/us");
+    });
+
+    test("a result older than PROBE_TTL_DAYS is ignored", async () => {
+      const cache = freshCache();
+      seedProbes(cache, { "m/x": { cf: { required: { result: "pass", at: at(8) } } } });
+      const { stdout } = await run(() => undefined, ["m/x"], ZDR_LIST, { list, cache });
+      expect(stdout).not.toContain("probe results override listings");
+      expect(stdout).toMatch(/cf +zdr - +tool_choice lacks required/);
+    });
+
+    test("--verify stores each conclusive probe in required mode, but not a busy one", async () => {
+      const cache = freshCache();
+      const { output } = await run((tag) => (tag === "together" ? busy() : "Wafer"), ["m/x", "--verify"], ZDR_LIST, {
+        cache,
+      });
+      expect(output).toContain("verified pin: m/x:wafer/us");
+      expect(readProbes(cache)).toEqual({
+        "m/x": { "wafer/us": { required: { result: "pass", at: expect.any(String) } } },
+      });
+      // A plain reply under tool_choice required is a verdict; a reply from the wrong provider is not.
+      const text = () =>
+        new Response(
+          JSON.stringify({ provider: "Wafer", choices: [{ finish_reason: "stop", message: { content: "OK" } }] }),
+        );
+      await run((tag) => (tag === "wafer/us" ? text() : "Wafer"), ["m/x", "--verify"], ZDR_LIST, { cache });
+      expect(readProbes(cache)).toEqual({
+        "m/x": { "wafer/us": { required: { result: "fail", at: expect.any(String) } } },
+      });
+    });
+  });
 });
 
 describe("--probe", () => {
@@ -1022,6 +1111,18 @@ describe("--probe", () => {
       mode === "none" || mode === "auto" ? cut : good(mode),
     );
     expect(code).toBe(0);
+  });
+
+  test("stores each mode's result under the model and the endpoint's own tag", async () => {
+    const withCall = {
+      provider: "Cloudflare",
+      choices: [{ finish_reason: "tool_calls", message: { tool_calls: [CALL] } }],
+    };
+    await run(["m/x", "--probe", "CF"], (mode) => (mode === "none" ? withCall : good(mode)));
+    const entry = (result: string) => ({ result, at: expect.any(String) });
+    expect(readProbes(process.env.XDG_CACHE_HOME!)).toEqual({
+      "m/x": { cf: { none: entry("fail"), auto: entry("pass"), required: entry("pass"), function: entry("pass") } },
+    });
   });
 
   test("an unknown tag exits 1 without requests", async () => {
