@@ -744,6 +744,41 @@ describe("end to end against a mocked OpenRouter", () => {
       expect(stderr).toContain("--audit-fallback sends real requests and needs an API key");
     });
 
+    test.each([
+      ["no price", { pricing: { prompt: null, completion: "0.000004" } }],
+      ["a price that isn't a number", { pricing: { prompt: "0.000001", completion: "free" } }],
+    ])("an endpoint with %s can't be bounded, so it exits 2 before any request", async (_, overrides) => {
+      const list = [ep("unpriced", overrides), ...endpoints];
+      const { code, probes, stderr } = await run(mixed(), ["m/x", "--verify", "--audit-fallback", "1"], ZDR_LIST, {
+        list,
+      });
+      expect(code).toBe(2);
+      expect(probes).toHaveLength(0);
+      expect(stderr).toContain("can't bound the cost of m/x");
+    });
+
+    test("a malformed endpoint can't be bounded either", async () => {
+      const list = [{ provider_name: "Broken" }, ...endpoints] as typeof endpoints;
+      const { code, probes } = await run(mixed(), ["m/x", "--audit-fallback", "1"], ZDR_LIST, { list });
+      expect(code).toBe(2);
+      expect(probes).toHaveLength(0);
+    });
+
+    test("provider and tier labels from a response are made safe to print", async () => {
+      const { stdout, output } = await run(routing([served(`Evil\u001b[2J${KEY}`, { tier: "flex\u0007" })]), [
+        "m/x",
+        "--audit-fallback",
+        "1",
+        "--json",
+      ]);
+      expect(output).not.toContain(KEY);
+      expect(output).not.toContain("\u001b");
+      expect(JSON.parse(stdout).models[0].audit[0]).toMatchObject({
+        provider: "Evil [2J[redacted]",
+        serviceTier: "flex",
+      });
+    });
+
     test("a worst case over the cap exits 2 before any request, --verify's included", async () => {
       // $100/M in and out: 50 requests can cost 50 × (200 + 512) × $0.0001 = $3.56.
       const list = [ep("pricey", { pricing: { prompt: "0.0001", completion: "0.0001" } }), ...endpoints];

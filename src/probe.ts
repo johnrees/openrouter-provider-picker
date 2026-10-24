@@ -243,10 +243,12 @@ async function auditOne(
   const sample = (body: ChatResponse | null, served: boolean): AuditSample => {
     const provider = served && typeof body?.provider === "string" ? body.provider : null;
     const serviceTier = served && typeof body?.service_tier === "string" ? body.service_tier : null;
+    // Raw values match endpoints; the recorded ones reach the terminal and JSON, so they are made safe to print.
+    const label = (text: string | null) => (text === null ? null : sanitize(text, auth.key));
     return {
-      provider,
+      provider: label(provider),
       quantization: provider === null ? null : servedQuantization(provider, serviceTier, endpoints),
-      serviceTier,
+      serviceTier: label(serviceTier),
       toolCallValid: served && toolCallProblem(body) === undefined,
       ms: Math.round(performance.now() - started),
     };

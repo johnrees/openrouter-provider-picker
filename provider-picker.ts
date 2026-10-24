@@ -296,6 +296,7 @@ async function sendProbes(report: Report, { options, auth }: Context): Promise<R
 
 /** The most `n` unpinned requests can cost: default routing may choose any endpoint, so take the highest prices. */
 function auditWorstCase(endpoints: readonly Endpoint[], n: number): number {
+  // main refuses to audit a model with an unpriced endpoint, so every rate here is known.
   const highest = (rates: (string | null | undefined)[]) => Math.max(0, ...rates.map((rate) => perMillion(rate) ?? 0));
   const perRequest =
     AUDIT_PROMPT_TOKENS * highest(endpoints.map((ep) => ep.pricing.prompt)) +
@@ -641,6 +642,19 @@ export async function main(argv: string[]): Promise<number> {
   if (n !== undefined) {
     // The audit's cost is bounded over every model before any paid request, --verify's included, is sent.
     const audited = (await Promise.all(fetched)).filter((report) => !report.error);
+    // Default routing may choose an endpoint with no listed price, or one opp skipped as malformed, so neither can be bounded.
+    const unpriced = audited.filter(
+      ({ endpoints, malformed }) =>
+        malformed > 0 ||
+        endpoints.some(
+          ({ pricing }) => perMillion(pricing.prompt) === undefined || perMillion(pricing.completion) === undefined,
+        ),
+    );
+    if (unpriced.length) {
+      const slugs = unpriced.map(({ slug }) => slug).join(", ");
+      console.error(`${NAME}: --audit-fallback: can't bound the cost of ${slugs}: an endpoint has no usable price`);
+      return 2;
+    }
     const usd = audited.reduce((sum, report) => sum + auditWorstCase(report.endpoints, n), 0);
     const estimate = `up to ${fmtUsd(usd)} for ${n * audited.length} requests to ${audited.map(({ slug }) => slug).join(", ")}`;
     if (usd > AUDIT_MAX_USD) {
