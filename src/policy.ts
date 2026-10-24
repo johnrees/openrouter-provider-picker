@@ -335,14 +335,17 @@ export function rank(endpoints: readonly Endpoint[], probed: ReadonlyMap<string,
   // uptime or precision. Anything far pricier ranks after every endpoint that
   // isn't, keeping its order among its peers. An endpoint with no such
   // baseline is never eliminated. A row with unverified tool_choice gives up
-  // verification, so it never sets the baseline and can't eliminate a verified row.
+  // verification, so it sets the baseline only for other unverified rows and
+  // can't eliminate a verified one.
   const best = eligible.map(reliabilityKey).reduce((a, b) => (compareKeys(a, b) <= 0 ? a : b));
   const topTier = eligible
-    .filter((ep) => !ep.tool_choice_unverified && compareKeys(reliabilityKey(ep), best) === 0)
-    .map((ep) => ({ level: quantLevel(ep), cost: referenceRunCost(ep) }));
+    .filter((ep) => compareKeys(reliabilityKey(ep), best) === 0)
+    .map((ep) => ({ level: quantLevel(ep), cost: referenceRunCost(ep), unverified: ep.tool_choice_unverified }));
   const baseline = (ep: Endpoint): number => {
     const level = quantLevel(ep);
-    const costs = topTier.filter((row) => row.level >= level).map(({ cost }) => cost);
+    const costs = topTier
+      .filter((row) => row.level >= level && (ep.tool_choice_unverified || !row.unverified))
+      .map(({ cost }) => cost);
     return Math.min(...costs.filter((cost) => cost !== undefined));
   };
 

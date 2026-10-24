@@ -372,6 +372,14 @@ describe("gateways", () => {
       ["cheap", false],
       ["flaky", false],
     ]);
+    // Among unverified rows the guard still holds: a far pricier one ranks after a cheap one, though faster.
+    const fastPricey = { ...priceyUnverified, tag: "fast-pricey", latency_last_30m: { p50: 50 } };
+    expect(
+      rank([fastPricey, unverified]).map(({ endpoint, priceEliminated }) => [endpoint.tag, priceEliminated]),
+    ).toEqual([
+      ["cheap", false],
+      ["fast-pricey", true],
+    ]);
   });
 
   test("a borrowed verdict names the OpenRouter provider it came from", () => {
