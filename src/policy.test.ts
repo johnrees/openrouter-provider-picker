@@ -4,12 +4,14 @@ import { isEndpoint } from "./openrouter.ts";
 import {
   type Endpoint,
   freshProbes,
+  gatewayOf,
   ineligibleReasons,
   locationReasons,
   matchesProvider,
   PROBE_TTL_DAYS,
   perMillion,
   pinRouting,
+  probedFor,
   quantizationReported,
   quantLevel,
   probeOverrides,
@@ -329,5 +331,79 @@ describe("pinning", () => {
     });
     expect(pinRouting(list[1]!, list)).toEqual({ only: ["fireworks/spot"], allow_fallbacks: false });
     expect("ignore" in pinRouting(list[1]!, list)).toBe(false);
+  });
+});
+
+describe("gateways", () => {
+  const vercel = (tag: string, overrides: Partial<Endpoint> = {}) => ep(tag, { gateway: "vercel", ...overrides });
+
+  test("an unverified row stays eligible and ranks after every verified row of its reliability tier only", () => {
+    const unverified = vercel("fast", {
+      supports_tool_choice: null,
+      tool_choice_unverified: true,
+      latency_last_30m: { p50: 50 },
+    });
+    const flaky = ep("flaky", { uptime_last_1d: 90 });
+    expect(ineligibleReasons(unverified)).toEqual([]);
+    expect(tags([flaky, unverified, ep("slow", { latency_last_30m: { p50: 2000 } })])).toEqual([
+      "slow",
+      "fast",
+      "flaky",
+    ]);
+  });
+
+  test("an unverified row never sets the price baseline, so it can't eliminate a verified row", () => {
+    const cheap = { prompt: "0.0000001", input_cache_read: "0.00000001", completion: "0.0000004" };
+    const unverified = vercel("cheap", { supports_tool_choice: null, tool_choice_unverified: true, pricing: cheap });
+    const ranked = rank([unverified, ep("verified")]);
+    expect(ranked.map(({ endpoint, priceEliminated }) => [endpoint.tag, priceEliminated])).toEqual([
+      ["verified", false],
+      ["cheap", false],
+    ]);
+    // A verified row still sets the baseline that an unverified row is measured against.
+    const pricey = { prompt: "0.00001", input_cache_read: "0.000001", completion: "0.00004" };
+    const priceyUnverified = { ...unverified, pricing: pricey };
+    expect(rank([priceyUnverified, ep("verified")]).at(-1)?.priceEliminated).toBe(true);
+    // A less reliable verified row is no baseline for the top tier, even when only unverified rows are in it.
+    const flaky = ep("flaky", { uptime_last_1d: 80 });
+    expect(
+      rank([priceyUnverified, flaky]).map(({ endpoint, priceEliminated }) => [endpoint.tag, priceEliminated]),
+    ).toEqual([
+      ["cheap", false],
+      ["flaky", false],
+    ]);
+  });
+
+  test("a borrowed verdict names the OpenRouter provider it came from", () => {
+    const borrowed = vercel("m", {
+      supports_tool_choice: { none: true, auto: true, required: false, function: false },
+      tool_choice_from: "m",
+    });
+    expect(ineligibleReasons(borrowed)).toEqual(["tool_choice lacks required/function (from openrouter m)"]);
+  });
+
+  test("stored probes apply to OpenRouter rows only, though tags can match across gateways", () => {
+    const probed = new Map([["a", { required: "fail" as const }]]);
+    expect(probedFor(probed, ep("a"))).toEqual({ required: "fail" });
+    expect(probedFor(probed, vercel("a"))).toBeUndefined();
+    expect(rank([ep("a"), vercel("a")], probed).map(({ endpoint }) => gatewayOf(endpoint))).toEqual(["vercel"]);
+  });
+
+  test("full ties break on tag, then gateway", () => {
+    const ranked = rank([vercel("a"), ep("b"), ep("a", { gateway: "openrouter" })]);
+    expect(ranked.map(({ endpoint }) => `${gatewayOf(endpoint)}:${endpoint.tag}`)).toEqual([
+      "openrouter:a",
+      "vercel:a",
+      "openrouter:b",
+    ]);
+  });
+
+  test("an OpenRouter pin's ignore list comes from OpenRouter rows only", () => {
+    const pick = ep("fireworks");
+    expect(pinRouting(pick, [pick, vercel("fireworks/x"), ep("fireworks/fast")])).toEqual({
+      only: ["fireworks"],
+      ignore: ["fireworks/fast"],
+      allow_fallbacks: false,
+    });
   });
 });

@@ -4,7 +4,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fmtRate, main, parseOptions, resolveAuth } from "./provider-picker.ts";
-import { ep } from "./src/fixtures.ts";
+import { ep, vercelFixture } from "./src/fixtures.ts";
+import type { Endpoint } from "./src/policy.ts";
 
 /** A new, empty XDG_CACHE_HOME, so probe results never reach the real store or leak between runs. */
 const freshCache = (): string => mkdtempSync(join(tmpdir(), "opp-cache-"));
@@ -23,6 +24,7 @@ describe("parseOptions", () => {
   test("defaults", () => {
     expect(parseOptions(["z-ai/glm-5.3"])).toEqual({
       slugs: ["z-ai/glm-5.3"],
+      gateways: ["openrouter"],
       providers: [],
       excludeProviders: [],
       excludeCountries: [],
@@ -159,13 +161,24 @@ describe("main", () => {
       expect(await main(["m/x", "--audit-fallback", "5", "--pick"])).toBe(2);
       expect(await main(["--help"])).toBe(0);
       const help = String(log.mock.calls[0]?.[0]);
-      const headings = ["Models:", "Eligibility:", "Probes (paid requests)", "Output:", "Auth:", "Exit status:"];
+      const headings = [
+        "Models:",
+        "Sources:",
+        "Eligibility:",
+        "Probes (paid requests)",
+        "Output:",
+        "Auth:",
+        "Exit status:",
+      ];
       const at = headings.map((heading) => help.indexOf(`\n${heading}`));
       expect(at.every((index) => index > 0)).toBe(true);
       expect(at).toEqual([...at].sort((a, b) => a - b));
-      expect(help.slice(at[1], at[2])).toContain("--exclude-country");
-      expect(help.slice(at[2], at[3])).toContain("--probe");
-      expect(help.slice(at[2], at[3])).toContain("--audit-fallback <n>");
+      expect(help.slice(at[1], at[2])).toContain("--gateway <name,...>");
+      expect(help.slice(at[1], at[2])).toContain("flagged tc? and ranks after the verified rows");
+      expect(help.slice(at[2], at[3])).toContain("--exclude-country");
+      expect(help.slice(at[3], at[4])).toContain("--probe");
+      expect(help.slice(at[3], at[4])).toContain("--audit-fallback <n>");
+      expect(help.slice(at[5], at[6])).toContain("AI_GATEWAY_API_KEY");
     } finally {
       error.mockRestore();
       log.mockRestore();
@@ -647,10 +660,12 @@ describe("end to end against a mocked OpenRouter", () => {
     const { models } = JSON.parse((await run(() => undefined, ["m/x", "--json"])).stdout);
     expect(models[0].ineligible).toEqual([
       {
+        gateway: "openrouter",
         endpoint: "broken",
         provider: "broken",
         zdr: true,
         reasons: ["status -2"],
+        toolChoiceVerified: true,
         toolChoiceSource: { none: "listing", auto: "listing", required: "listing", function: "listing" },
       },
     ]);
@@ -1181,6 +1196,7 @@ describe("completion", () => {
     const zsh = await run(["--completions", "zsh"], ok);
     expect(zsh.code).toBe(0);
     expect(zsh.stdout.startsWith("#compdef opp")).toBe(true);
+    expect(zsh.stdout).toContain("'*--gateway[where to list endpoints]:gateway:(openrouter vercel all)'");
     expect(zsh.fetches).toBe(0);
     const bash = await run(["--completions", "bash"], ok);
     expect(bash.code).toBe(2);
@@ -1226,5 +1242,451 @@ describe("completion", () => {
   test("with no cache and no network, --list-models prints nothing and no error", async () => {
     const out = await run(["--list-models"], down);
     expect(out).toMatchObject({ code: 0, stdout: "", stderr: "" });
+  });
+});
+
+describe("--gateway", () => {
+  const OR_KEY = "sk-or-v1-test-secret-key";
+  const AI_KEY = "test-ai-gateway-secret";
+  const SLUG = "z-ai/glm-5.3";
+  const VERCEL = "https://ai-gateway.vercel.sh/v1";
+  // OpenRouter serves alpha (eligible, top tier), mike (lacks required and function), quebec (down, but listing every
+  // mode) and lima (a lower tier). The Vercel fixture adds alpha, mike and quebec under the same names, plus oscar and
+  // papa, which OpenRouter lacks.
+  const openrouter = [
+    ep("alpha/fp8", { provider_name: "Alpha", quantization: "fp8" }),
+    ep("mike/fp8", {
+      provider_name: "Mike",
+      quantization: "fp8",
+      supports_tool_choice: { none: true, auto: true, required: false, function: false },
+    }),
+    ep("quebec", { provider_name: "Quebec", status: -1 }),
+    ep("lima", { provider_name: "Lima", uptime_last_1d: 90, uptime_last_30m: 90 }),
+  ];
+  const TOOL_CALL = {
+    finish_reason: "tool_calls",
+    message: { tool_calls: [{ type: "function", function: { name: "ok", arguments: "{}" } }] },
+  };
+
+  type Call = { url: string; init: RequestInit };
+  /**
+   * Runs main against a fake OpenRouter and Vercel. `serve` names the provider that answers a pinned probe on
+   * each gateway; by default the pinned one. `vercel` is the Vercel listing, or a function giving a raw Response.
+   */
+  async function run(
+    argv: string[],
+    {
+      orKey = OR_KEY as string | null,
+      aiKey = AI_KEY as string | null,
+      vercel = vercelFixture as unknown,
+      providers = [] as unknown[],
+      zdrList = { data: [] } as unknown,
+      list = openrouter as Endpoint[] | null,
+      serve = (_gateway: string, provider: string): string | undefined => provider,
+      vercelReply = undefined as (() => Response) | undefined,
+    } = {},
+  ) {
+    const calls: Call[] = [];
+    const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input: unknown, init: RequestInit = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.startsWith(VERCEL)) {
+        if (url.endsWith("/endpoints")) return typeof vercel === "function" ? vercel() : json(vercel);
+        if (vercelReply) return vercelReply();
+        const slug = JSON.parse(String(init.body)).providerOptions.gateway.only[0];
+        const served = serve("vercel", slug);
+        const metadata = served && { provider_metadata: { gateway: { routing: { finalProvider: served } } } };
+        return json({ choices: [{ ...TOOL_CALL, message: { ...TOOL_CALL.message, ...metadata } }] });
+      }
+      if (url.endsWith("/providers")) return json({ data: providers });
+      if (url.endsWith("/endpoints/zdr"))
+        return zdrList === null ? new Response("down", { status: 503 }) : json(zdrList);
+      if (url.endsWith("/endpoints")) {
+        return list === null ? new Response("down", { status: 503 }) : json({ data: { endpoints: list } });
+      }
+      const tag = JSON.parse(String(init.body)).provider.only[0];
+      const served = serve("openrouter", list!.find((e) => e.tag === tag)!.provider_name);
+      return json({ ...(served && { provider: served }), choices: [TOOL_CALL] });
+    }) as unknown as typeof fetch);
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    const names = ["OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "HOME", "XDG_DATA_HOME"] as const;
+    const saved = names.map((name) => [name, process.env[name]] as const);
+    for (const [name, value] of [
+      ["OPENROUTER_API_KEY", orKey],
+      ["AI_GATEWAY_API_KEY", aiKey],
+      ["XDG_DATA_HOME", null],
+    ] as const) {
+      if (value === null) delete process.env[name];
+      else process.env[name] = value;
+    }
+    process.env.HOME = "/nonexistent"; // no opencode credential store
+    try {
+      const code = await main(argv);
+      const stdout = log.mock.calls.flat().join("\n");
+      const stderr = error.mock.calls.flat().join("\n");
+      const toVercel = calls.filter(({ url }) => url.startsWith(VERCEL));
+      const probes = calls
+        .filter(({ url }) => url.endsWith("/chat/completions"))
+        .map(({ url, init }) => ({ url, body: JSON.parse(String(init.body)) }));
+      return { code, stdout, stderr, output: `${stdout}\n${stderr}`, calls, toVercel, probes };
+    } finally {
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      fetchMock.mockRestore();
+      log.mockRestore();
+      error.mockRestore();
+    }
+  }
+
+  type Row = { gateway: string; endpoint: string };
+  const ids = (rows: Row[]) => rows.map(({ gateway, endpoint }) => `${gateway}:${endpoint}`);
+  const jsonModel = async (argv: string[], options?: Parameters<typeof run>[1]) =>
+    JSON.parse((await run([SLUG, "--json", ...argv], options)).stdout).models[0];
+
+  describe("parsing", () => {
+    test("one flag, repeatable or comma-separated, deduplicated, in a fixed order", () => {
+      expect(parseOptions(["m/x", "--gateway", "vercel"]).gateways).toEqual(["vercel"]);
+      expect(parseOptions(["m/x", "--gateway=vercel"]).gateways).toEqual(["vercel"]);
+      expect(parseOptions(["m/x", "--gateway", "vercel", "--gateway", "openrouter"]).gateways).toEqual([
+        "openrouter",
+        "vercel",
+      ]);
+      expect(parseOptions(["m/x", "--gateway", "vercel,OpenRouter,vercel"]).gateways).toEqual(["openrouter", "vercel"]);
+      expect(parseOptions(["m/x", "--gateway", "all"]).gateways).toBe("all");
+      expect(parseOptions(["m/x", "--gateway", "openrouter", "--audit-fallback", "2"]).gateways).toEqual([
+        "openrouter",
+      ]);
+    });
+
+    test.each([
+      [["--gateway", ""], /gateway must not be empty/],
+      [["--gateway="], /gateway must not be empty/],
+      [["--gateway", "vercel,"], /gateway must not be empty/],
+      [["--gateway", "nope"], /unknown gateway "nope"/],
+      [["--gateway", "all,vercel"], /all can't be combined/],
+      [["--gateway", "all", "--gateway", "openrouter"], /all can't be combined/],
+      [["--gateway", "cloudflare"], /cloudflare isn't supported yet/],
+      [["--gateway", "vercel", "--audit-fallback", "2"], /--audit-fallback measures OpenRouter's default routing/],
+      [["--gateway", "all", "--audit-fallback", "2"], /--audit-fallback measures OpenRouter's default routing/],
+      [["--gateway", "vercel", "--probe", "a"], /--probe tests OpenRouter endpoints/],
+    ])("rejects %j, exiting 2", async (argv, message) => {
+      expect(() => parseOptions(["m/x", ...argv])).toThrow(message);
+      const { code, calls } = await run(["m/x", ...argv]);
+      expect(code).toBe(2);
+      expect(calls).toHaveLength(0);
+    });
+  });
+
+  test("without the flag nothing changes: OpenRouter rows only and the bare tag", async () => {
+    const { stdout, toVercel } = await run([SLUG, "--pick"]);
+    expect(stdout).toBe("alpha/fp8");
+    expect(toVercel).toHaveLength(0);
+    const text = await run([SLUG]);
+    expect(text.stdout).toContain("# OpenRouter endpoint ranking");
+    expect(text.stdout).toContain("# eligible: native tools");
+    expect(text.stdout).not.toContain("gateway");
+    expect(text.stdout).not.toContain("# fees");
+  });
+
+  test("--gateway vercel ranks only Vercel rows, borrowing OpenRouter's tool_choice verdicts", async () => {
+    const model = await jsonModel(["--gateway", "vercel"]);
+    expect(ids(model.ranked)).toEqual(["vercel:quebec", "vercel:alpha", "vercel:oscar"]);
+    expect(model.ineligible).toContainEqual(
+      expect.objectContaining({
+        gateway: "vercel",
+        endpoint: "mike",
+        reasons: ["tool_choice lacks required/function (from openrouter mike)"],
+        toolChoiceVerified: true,
+      }),
+    );
+    expect(model.ineligible).toContainEqual(
+      expect.objectContaining({ endpoint: "papa", reasons: ["tool_choice lacks none/auto/required/function"] }),
+    );
+    const { stdout, calls } = await run([SLUG, "--gateway", "vercel"]);
+    expect(calls.map(({ url }) => url)).toContain(`${VERCEL}/models/zai/glm-5.3/endpoints`);
+    expect(stdout).toContain("# Endpoint ranking");
+    expect(stdout).toContain("# eligible (vercel): native tools");
+    expect(stdout).toContain("(skipped 1 malformed endpoint)");
+    expect(stdout).toMatch(/vercel:mike +zdr - +tool_choice lacks required\/function \(from openrouter mike\)/);
+  });
+
+  test("with both gateways, one table: unverified rows rank after the verified rows of their tier", async () => {
+    const model = await jsonModel(["--gateway", "openrouter,vercel"]);
+    expect(ids(model.ranked)).toEqual([
+      "vercel:quebec",
+      "vercel:alpha",
+      "openrouter:alpha/fp8",
+      "vercel:oscar", // fastest of all, but tc?
+      "openrouter:lima", // a lower uptime tier
+    ]);
+    const oscar = model.ranked.find(({ endpoint }: Row) => endpoint === "oscar");
+    expect(oscar.toolChoiceVerified).toBe(false);
+    expect(oscar.toolChoiceSource.required).toBe("unverified");
+    const alpha = model.ranked.find(({ gateway }: Row) => gateway === "vercel");
+    expect(alpha).toMatchObject({ toolChoiceVerified: true });
+    expect(model.ranked[1].toolChoiceSource).toEqual({
+      none: "openrouter",
+      auto: "openrouter",
+      required: "openrouter",
+      function: "openrouter",
+    });
+    expect(ids(model.ineligible).sort()).toEqual([
+      "openrouter:mike/fp8",
+      "openrouter:quebec",
+      "vercel:mike",
+      "vercel:papa",
+    ]);
+
+    const { stdout } = await run([SLUG, "--gateway", "openrouter,vercel"]);
+    expect(stdout).toContain("# eligible (openrouter, vercel): native tools");
+    expect(stdout).toContain("> verified tool_choice >");
+    expect(stdout).toContain("# vercel rows: up30m = uptime 1h, up5m = uptime 15m, ttfb and tok/s = 1h p50");
+    expect(stdout).toMatch(/^ +# +gateway +endpoint +quant/m);
+    expect(stdout).toMatch(/▶ +1 +vercel +quebec /);
+    expect(stdout).toMatch(/ 3 +openrouter +alpha\/fp8 /);
+    expect(stdout).toMatch(/ 4 +vercel +oscar .* tc\?$/m);
+    expect(stdout.trimEnd()).toEndWith(
+      "# fees: OpenRouter adds 5.5% (min $0.80) to card credit purchases; Vercel AI Gateway adds no markup. " +
+        "$run includes neither.",
+    );
+  });
+
+  test("a Vercel row prices at its listed rate: the discount and region prices don't change $run", async () => {
+    const model = await jsonModel(["--gateway", "vercel"]);
+    const quebec = model.ranked.find(({ endpoint }: Row) => endpoint === "quebec");
+    expect(quebec.referenceRunUsd).toBeCloseTo(3.18);
+    expect(quebec.usdPerMillion).toEqual({ input: 1.5, cacheRead: 0.15, output: 6 });
+  });
+
+  test("--zdr uses Vercel's has_zdr, and needs no OpenRouter ZDR list for Vercel rows", async () => {
+    const { code, stdout, calls } = await run([SLUG, "--gateway", "vercel", "--zdr", "--json"], { zdrList: null });
+    expect(code).toBe(0);
+    expect(calls.some(({ url }) => url.endsWith("/endpoints/zdr"))).toBe(false);
+    const model = JSON.parse(stdout).models[0];
+    expect(ids(model.ranked)).toEqual(["vercel:quebec", "vercel:alpha"]);
+    expect(model.ineligible).toContainEqual(
+      expect.objectContaining({ endpoint: "oscar", zdr: null, reasons: ["ZDR unknown"] }),
+    );
+    expect(model.ineligible).toContainEqual(
+      expect.objectContaining({ endpoint: "mike", reasons: expect.arrayContaining(["not ZDR"]) }),
+    );
+  });
+
+  test("with another gateway listed, --zdr without OpenRouter's ZDR list excludes only OpenRouter's rows", async () => {
+    const { code, stdout, stderr } = await run([SLUG, "--gateway", "openrouter,vercel", "--zdr", "--json"], {
+      zdrList: null,
+    });
+    expect(code).toBe(0);
+    expect(stderr).toContain("opp: the ZDR endpoint list unavailable");
+    const model = JSON.parse(stdout).models[0];
+    expect(ids(model.ranked)).toEqual(["vercel:quebec", "vercel:alpha"]);
+    expect(model.ineligible).toContainEqual(
+      expect.objectContaining({ gateway: "openrouter", endpoint: "alpha/fp8", reasons: ["ZDR unknown"] }),
+    );
+  });
+
+  test("--json lists the gateways used and the pick in its gateway's syntax", async () => {
+    const { stdout } = await run([SLUG, "--json", "--gateway", "vercel,openrouter"]);
+    const json = JSON.parse(stdout);
+    expect(json.gateways).toEqual(["openrouter", "vercel"]);
+    expect(json.models[0].pick).toEqual({
+      pin: "zai/glm-5.3 vercel:quebec",
+      gateway: "vercel",
+      model: "zai/glm-5.3",
+      endpoint: "quebec",
+      provider: "quebec",
+      routing: { gateway: { only: ["quebec"] } },
+      verified: false,
+      quantizationReported: true,
+    });
+    const plain = JSON.parse((await run([SLUG, "--json"])).stdout);
+    expect(plain.gateways).toEqual(["openrouter"]);
+    expect(plain.models[0].pick).toMatchObject({
+      pin: `${SLUG}:alpha/fp8`,
+      gateway: "openrouter",
+      model: SLUG,
+      routing: { only: ["alpha/fp8"], allow_fallbacks: false },
+    });
+  });
+
+  test("a Vercel pick prints vercel:<slug> under --pick, and the pin line ends the same, then providerOptions", async () => {
+    const picked = await run([SLUG, "--pick", "--gateway", "openrouter,vercel"]);
+    expect(picked.stdout).toBe("vercel:quebec");
+    expect(picked.stderr).not.toContain("pin needs ignore");
+    const { stdout } = await run([SLUG, "--gateway", "vercel"]);
+    const lines = stdout.split("\n");
+    const pin = lines.findIndex((line) => line.startsWith("  pin: "));
+    expect(lines[pin]).toBe("  pin: zai/glm-5.3 vercel:quebec");
+    expect(lines[pin + 1]).toBe(`  routing: "providerOptions": {"gateway":{"only":["quebec"]}}`);
+  });
+
+  test("-p and -e match a Vercel row by its OpenRouter alias; -x looks it up under that slug", async () => {
+    const bedrock = { ...(vercelFixture.data.endpoints[0] as object), provider_name: "bedrock" };
+    const vercel = { data: { endpoints: [bedrock] } };
+    const kept = await jsonModel(["--gateway", "vercel", "-p", "amazon-bedrock"], { vercel });
+    expect(ids(kept.ranked)).toEqual(["vercel:bedrock"]);
+    // Part of the alias matches too, as a provider filter matches part of a name.
+    const partial = await jsonModel(["--gateway", "vercel", "-p", "amazon"], { vercel });
+    expect(ids(partial.ranked)).toEqual(["vercel:bedrock"]);
+    const excluded = await jsonModel(["--gateway", "vercel", "-e", "amazon-bedrock"], { vercel });
+    expect(excluded.ranked).toEqual([]);
+    const providers = [{ slug: "amazon-bedrock", headquarters: "US", datacenters: ["US", "RU"] }];
+    const located = await jsonModel(["--gateway", "vercel", "-x", "RU"], { vercel, providers });
+    expect(located.ineligible[0]).toMatchObject({ endpoint: "bedrock", reasons: ["datacenter in RU"] });
+  });
+
+  test("-p and -e take either gateway's spelling, and apply it to both gateways' rows", async () => {
+    const togetherai = { ...(vercelFixture.data.endpoints[0] as object), provider_name: "togetherai" };
+    const options = { vercel: { data: { endpoints: [togetherai] } }, list: [ep("together"), ep("other")] };
+    const excluded = await jsonModel(["--gateway", "all", "-e", "togetherai"], options);
+    expect(ids(excluded.ranked)).toEqual(["openrouter:other"]);
+    const kept = await jsonModel(["--gateway", "all", "-p", "togetherai"], options);
+    expect(ids(kept.ranked)).toEqual(["vercel:togetherai", "openrouter:together"]);
+  });
+
+  test("with --gateway vercel, an OpenRouter outage leaves the Vercel rows unverified but ranked", async () => {
+    const { code, stdout } = await run([SLUG, "--gateway", "vercel"], { list: null });
+    expect(code).toBe(0);
+    expect(stdout).toContain("  openrouter: HTTP 503");
+    // No verdict to borrow, so every row that lists tool_choice is tc? and speed decides.
+    expect(stdout.split("\n").filter((line) => line.endsWith("tc?"))).toHaveLength(4);
+    expect(stdout).toContain("pin: zai/glm-5.3 vercel:oscar");
+  });
+
+  test("a failed Vercel fetch is noted under the model and OpenRouter's rows rank alone", async () => {
+    const down = () => new Response(JSON.stringify({ error: { message: "Model not found" } }), { status: 404 });
+    const { code, stdout } = await run([SLUG, "--gateway", "openrouter,vercel"], { vercel: down });
+    expect(code).toBe(0);
+    expect(stdout).toContain("  vercel: HTTP 404: Model not found");
+    expect(stdout).toContain(`pin: ${SLUG}:alpha/fp8`);
+    const alone = await run([SLUG, "--gateway", "vercel"], { vercel: down });
+    expect(alone.code).toBe(1);
+    expect(alone.stdout).toContain("fetch failed: vercel: HTTP 404: Model not found");
+    const picked = await run([SLUG, "--gateway", "openrouter,vercel", "--pick"], { vercel: down });
+    expect(picked.stdout).toBe("alpha/fp8");
+    expect(picked.stderr).toBe(`opp: ${SLUG}: vercel: HTTP 404: Model not found`);
+  });
+
+  describe("credentials", () => {
+    test("--gateway vercel --verify without AI_GATEWAY_API_KEY exits 2 and sends no request", async () => {
+      const { code, calls, stderr } = await run([SLUG, "--gateway", "vercel", "--verify"], { aiKey: null });
+      expect(code).toBe(2);
+      expect(calls).toHaveLength(0);
+      expect(stderr).toContain("set AI_GATEWAY_API_KEY");
+    });
+
+    test("--gateway vercel --verify needs no OpenRouter key", async () => {
+      const { code, stdout } = await run([SLUG, "--gateway", "vercel", "--verify"], { orKey: null });
+      expect(code).toBe(0);
+      expect(stdout).toContain("verified pin: zai/glm-5.3 vercel:quebec");
+    });
+
+    test("--gateway all --verify without AI_GATEWAY_API_KEY ranks OpenRouter only and skips Vercel on one line", async () => {
+      const { code, stdout, stderr, toVercel } = await run([SLUG, "--gateway", "all", "--verify", "--json"], {
+        aiKey: null,
+      });
+      expect(code).toBe(0);
+      expect(toVercel).toHaveLength(0);
+      expect(stderr.split("\n").filter((line) => line.includes("vercel"))).toEqual([
+        "opp: --gateway all: skipping vercel (no AI_GATEWAY_API_KEY)",
+      ]);
+      const json = JSON.parse(stdout);
+      expect(json.gateways).toEqual(["openrouter"]);
+      expect(json.models[0].ranked.every(({ gateway }: Row) => gateway === "openrouter")).toBe(true);
+    });
+
+    test("--gateway all lists every gateway when the run needs no key", async () => {
+      const { stdout } = await run([SLUG, "--gateway", "all", "--json"], { aiKey: null, orKey: null });
+      expect(JSON.parse(stdout).gateways).toEqual(["openrouter", "vercel"]);
+    });
+
+    test("--verify walks both gateways, each probe with its own gateway's key; only OpenRouter probes are stored", async () => {
+      const cache = freshCache();
+      process.env.XDG_CACHE_HOME = cache;
+      // Vercel's quebec and alpha are answered by another provider, so the walk reaches OpenRouter's alpha/fp8.
+      const { code, stdout, calls, probes } = await run([SLUG, "--gateway", "openrouter,vercel", "--verify"], {
+        serve: (gateway, provider) => (gateway === "vercel" ? "elsewhere" : provider),
+      });
+      expect(code).toBe(0);
+      expect(probes.map(({ url, body }) => [url, body.model, body.provider ?? body.providerOptions])).toEqual([
+        [`${VERCEL}/chat/completions`, "zai/glm-5.3", { gateway: { only: ["quebec"] } }],
+        [`${VERCEL}/chat/completions`, "zai/glm-5.3", { gateway: { only: ["alpha"] } }],
+        ["https://openrouter.ai/api/v1/chat/completions", SLUG, { only: ["alpha/fp8"], allow_fallbacks: false }],
+      ]);
+      expect(stdout).toContain("probe vercel:quebec: FAILED (served by elsewhere)");
+      expect(stdout).toContain(`verified pin: ${SLUG}:alpha/fp8`);
+      const auth = (call: Call) => (call.init.headers as Record<string, string> | undefined)?.Authorization;
+      for (const call of calls) {
+        const sent = JSON.stringify(call.init.headers ?? {});
+        if (call.url.startsWith(VERCEL)) expect(sent).not.toContain(OR_KEY);
+        else expect(sent).not.toContain(AI_KEY);
+      }
+      expect(calls.filter(({ url }) => url === `${VERCEL}/chat/completions`).map(auth)).toEqual([
+        `Bearer ${AI_KEY}`,
+        `Bearer ${AI_KEY}`,
+      ]);
+      expect(stdout).not.toContain(AI_KEY);
+      expect(readProbes(cache)).toEqual({
+        [SLUG]: { "alpha/fp8": { required: { result: "pass", at: expect.any(String) } } },
+      });
+    });
+
+    test("a Vercel probe with no finalProvider fails", async () => {
+      const { stdout } = await run([SLUG, "--gateway", "vercel", "--verify"], {
+        serve: () => undefined,
+      });
+      expect(stdout).toContain("probe vercel:quebec: FAILED (served by an unknown provider)");
+    });
+
+    describe("a gateway that refuses the account", () => {
+      const refusal = (status: number, message: string) => () =>
+        new Response(JSON.stringify({ error: { message, type: "forbidden" } }), { status });
+      const FREE = "Free tier users do not have access to this model";
+      const count = (text: string, part: string) => text.split(part).length - 1;
+
+      test.each([
+        [401, "Invalid API key"],
+        [403, "AI Gateway requires a valid credit card on file"],
+        [403, FREE],
+      ])("HTTP %d stops Vercel probes after the first, says why once, and exits 1", async (status, message) => {
+        const { code, output, stdout, probes } = await run([SLUG, "--gateway", "vercel", "--verify"], {
+          vercelReply: refusal(status, message),
+        });
+        expect(code).toBe(1);
+        expect(probes).toHaveLength(1);
+        expect(stdout).toContain(`probe vercel:quebec: FAILED (HTTP ${status} ${message})`);
+        expect(count(output, message)).toBe(1);
+        expect(stdout).toContain(
+          `no candidate served after 1 probe(s) (vercel refused the account (HTTP ${status}), 2 not probed)`,
+        );
+      });
+
+      test("under --pick the message goes to stderr once and stdout stays empty", async () => {
+        const { code, stdout, stderr, probes } = await run([SLUG, "--gateway", "vercel", "--verify", "--pick"], {
+          vercelReply: refusal(403, FREE),
+        });
+        expect(code).toBe(1);
+        expect(probes).toHaveLength(1);
+        expect(stdout).toBe("");
+        expect(count(stderr, FREE)).toBe(1);
+        expect(stderr).toContain("vercel refused the account (HTTP 403), 2 not probed");
+      });
+
+      test("the walk goes on through OpenRouter's candidates", async () => {
+        const { code, stdout, probes } = await run([SLUG, "--gateway", "openrouter,vercel", "--verify", "--json"], {
+          vercelReply: refusal(403, FREE),
+        });
+        expect(code).toBe(0);
+        expect(probes.map(({ url }) => new URL(url).host)).toEqual(["ai-gateway.vercel.sh", "openrouter.ai"]);
+        const model = JSON.parse(stdout).models[0];
+        expect(model.pick.endpoint).toBe("alpha/fp8");
+        // Vercel's alpha ranked between quebec and alpha/fp8, so it was skipped; oscar ranks after the pick.
+        expect(model.halted).toEqual([{ gateway: "vercel", status: 403, skipped: 1 }]);
+      });
+    });
   });
 });

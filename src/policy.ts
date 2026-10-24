@@ -47,6 +47,10 @@ export const AUDIT_PROMPT_TOKENS = 200;
 /** --audit-fallback refuses to start when its worst case over every model exceeds this many dollars. */
 export const AUDIT_MAX_USD = 0.5;
 
+/** Where opp can list a model's endpoints, in the order their rows are fetched and shown. */
+export const GATEWAYS = ["openrouter", "vercel"] as const;
+
+export type Gateway = (typeof GATEWAYS)[number];
 export type ToolChoiceMode = (typeof TOOL_CHOICE_MODES)[number];
 export type ProbeResult = { result: "pass" | "fail"; at: string };
 /** Stored probe results: model slug, then endpoint tag, then mode. */
@@ -55,8 +59,13 @@ export type ProbeStore = Record<string, Record<string, Partial<Record<ToolChoice
 export type Probed = Partial<Record<ToolChoiceMode, ProbeResult["result"]>>;
 type Percentiles = { p50?: number | null; p75?: number | null; p90?: number | null; p99?: number | null };
 
-/** The fields this tool reads from an entry of GET /models/{slug}/endpoints. */
+/**
+ * The fields this tool reads from an entry of OpenRouter's GET /models/{slug}/endpoints. Another gateway's
+ * rows are normalised to it (see vercel.ts), which fills the 30-minute fields from that gateway's own windows.
+ */
 export type Endpoint = {
+  /** The gateway that lists this row. Absent means OpenRouter. */
+  gateway?: Gateway;
   model_id?: string | null;
   provider_name: string;
   /** Unique per endpoint, e.g. "baseten/fp4/us". provider_name is not unique. */
@@ -68,6 +77,12 @@ export type Endpoint = {
   max_completion_tokens?: number | null;
   supported_parameters: string[];
   supports_tool_choice?: Partial<Record<ToolChoiceMode, unknown>> | null;
+  /** The OpenRouter provider whose listing supplied supports_tool_choice for another gateway's row. */
+  tool_choice_from?: string;
+  /** Another gateway's row that lists tool_choice but no per-mode support, with no OpenRouter verdict to borrow. */
+  tool_choice_unverified?: boolean;
+  /** Vercel's own zero-data-retention flag; OpenRouter rows use its ZDR list instead. */
+  has_zdr?: boolean | null;
   uptime_last_5m?: number | null;
   uptime_last_30m?: number | null;
   uptime_last_1d?: number | null;
@@ -104,9 +119,19 @@ export type Probe = {
   detail: string;
   /** When the probe got its answer, as an ISO time. */
   at: string;
+  /** The status (401 or 403) with which Vercel refused the account: no other endpoint there can serve this run. */
+  refused?: number;
 };
-/** `unprobed` counts the candidates left untried when the time budget ran out. */
-export type Verification = { probes: Probe[]; verified?: Endpoint; unprobed?: number };
+/**
+ * `unprobed` counts the candidates left untried when the time budget ran out. `halted` lists each gateway
+ * that refused the account, with its HTTP status and how many of its candidates were then skipped.
+ */
+export type Verification = {
+  probes: Probe[];
+  verified?: Endpoint;
+  unprobed?: number;
+  halted?: { gateway: Gateway; status: number; skipped: number }[];
+};
 /** One unpinned request's outcome under OpenRouter's default routing. A null provider means no response. */
 export type AuditSample = {
   provider: string | null;
@@ -131,11 +156,15 @@ export type Report = {
   ineligible: { endpoint: Endpoint; reasons: string[] }[];
   verification?: Verification;
   audit?: Audit;
-  /** Fresh probe results by endpoint tag, which replace the listing's tool_choice support. */
+  /** Fresh probe results by OpenRouter endpoint tag, which replace the listing's tool_choice support. */
   probed: ReadonlyMap<string, Probed>;
+  /** Gateways whose fetch failed while another's succeeded, so their rows are missing. */
+  gatewayErrors?: { gateway: Gateway; error: string }[];
 };
 export type Options = {
   slugs: string[];
+  /** The gateways named with --gateway, or "all" for every gateway whose credentials this run has. */
+  gateways: Gateway[] | "all";
   providers: string[];
   excludeProviders: string[];
   excludeCountries: string[];
@@ -171,6 +200,12 @@ export function freshProbes(store: ProbeStore, slug: string, now: number): Map<s
   return fresh;
 }
 
+export const gatewayOf = (ep: Endpoint): Gateway => ep.gateway ?? "openrouter";
+
+/** An endpoint's fresh probe results. Stored probes are keyed by OpenRouter tag, so they apply to OpenRouter rows only. */
+export const probedFor = (probed: ReadonlyMap<string, Probed>, ep: Endpoint): Probed | undefined =>
+  gatewayOf(ep) === "openrouter" ? probed.get(ep.tag) : undefined;
+
 export const listedToolChoice = (ep: Endpoint, mode: ToolChoiceMode): boolean =>
   ep.supports_tool_choice?.[mode] === true;
 
@@ -196,8 +231,12 @@ export function ineligibleReasons(ep: Endpoint, probed: Probed = {}): string[] {
   const reasons: string[] = [];
   if ((ep.status ?? 0) !== 0) reasons.push(`status ${ep.status}`);
   if (!ep.supported_parameters.includes("tools")) reasons.push("no native tools");
-  const missing = TOOL_CHOICE_MODES.filter((mode) => probed[mode] === undefined && !listedToolChoice(ep, mode));
-  if (missing.length) reasons.push(`tool_choice lacks ${missing.join("/")}`);
+  // An unverified row lists tool_choice with no per-mode support: it stays eligible and ranks last in its tier.
+  const missing = ep.tool_choice_unverified
+    ? []
+    : TOOL_CHOICE_MODES.filter((mode) => probed[mode] === undefined && !listedToolChoice(ep, mode));
+  const from = ep.tool_choice_from === undefined ? "" : ` (from openrouter ${ep.tool_choice_from})`;
+  if (missing.length) reasons.push(`tool_choice lacks ${missing.join("/")}${from}`);
   const failed = TOOL_CHOICE_MODES.filter((mode) => probed[mode] === "fail");
   if (failed.length) reasons.push(`probed: ${failed.join("/")} fail`);
   return reasons;
@@ -288,17 +327,18 @@ function compareKeys(a: readonly number[], b: readonly number[]): number {
 
 /** Ranks eligible endpoints best first and drops the ineligible ones. */
 export function rank(endpoints: readonly Endpoint[], probed: ReadonlyMap<string, Probed> = new Map()): Ranked[] {
-  const eligible = endpoints.filter((ep) => ineligibleReasons(ep, probed.get(ep.tag)).length === 0);
+  const eligible = endpoints.filter((ep) => ineligibleReasons(ep, probedFor(probed, ep)).length === 0);
   if (!eligible.length) return [];
 
   // Price guard baseline: the cheapest endpoint in the most reliable tier with
   // equal or better quantization, the cost of a choice that gives up nothing on
   // uptime or precision. Anything far pricier ranks after every endpoint that
   // isn't, keeping its order among its peers. An endpoint with no such
-  // baseline is never eliminated.
+  // baseline is never eliminated. A row with unverified tool_choice gives up
+  // verification, so it never sets the baseline and can't eliminate a verified row.
   const best = eligible.map(reliabilityKey).reduce((a, b) => (compareKeys(a, b) <= 0 ? a : b));
   const topTier = eligible
-    .filter((ep) => compareKeys(reliabilityKey(ep), best) === 0)
+    .filter((ep) => !ep.tool_choice_unverified && compareKeys(reliabilityKey(ep), best) === 0)
     .map((ep) => ({ level: quantLevel(ep), cost: referenceRunCost(ep) }));
   const baseline = (ep: Endpoint): number => {
     const level = quantLevel(ep);
@@ -309,6 +349,7 @@ export function rank(endpoints: readonly Endpoint[], probed: ReadonlyMap<string,
   const key = ({ endpoint: ep, cost, priceEliminated }: Ranked): number[] => [
     priceEliminated ? 1 : 0,
     ...reliabilityKey(ep),
+    ep.tool_choice_unverified ? 1 : 0, // within a reliability tier, verified tool_choice first
     asc(turnMs(ep)),
     asc(metric(ep.latency_last_30m?.p50)), // when throughput is unknown
     desc(quantLevel(ep)),
@@ -326,7 +367,12 @@ export function rank(endpoints: readonly Endpoint[], probed: ReadonlyMap<string,
         cost - cheapest > PRICE_ELIM_DELTA_USD;
       return { endpoint, cost, priceEliminated };
     })
-    .sort((a, b) => compareKeys(key(a), key(b)) || a.endpoint.tag.localeCompare(b.endpoint.tag));
+    .sort(
+      (a, b) =>
+        compareKeys(key(a), key(b)) ||
+        a.endpoint.tag.localeCompare(b.endpoint.tag) ||
+        gatewayOf(a.endpoint).localeCompare(gatewayOf(b.endpoint)),
+    );
 }
 
 export function matchesProvider(ep: Endpoint, filter: string): boolean {
@@ -338,10 +384,13 @@ export function matchesProvider(ep: Endpoint, filter: string): boolean {
  * The `provider` object for a chat request that pins this one endpoint. A
  * `model:provider` suffix does not do this: OpenRouter ignores it and routes
  * as usual. `only` matches by prefix, so a pin on "fireworks" also matches
- * "fireworks/fast"; `ignore` lists every such longer tag among `endpoints`
- * and is left out when there is none.
+ * "fireworks/fast"; `ignore` lists every such longer tag among the OpenRouter
+ * rows of `endpoints` and is left out when there is none.
  */
 export function pinRouting(ep: Endpoint, endpoints: readonly Endpoint[]) {
-  const ignore = endpoints.map(({ tag }) => tag).filter((tag) => tag.startsWith(`${ep.tag}/`));
+  const ignore = endpoints
+    .filter((other) => gatewayOf(other) === "openrouter")
+    .map(({ tag }) => tag)
+    .filter((tag) => tag.startsWith(`${ep.tag}/`));
   return { only: [ep.tag], ...(ignore.length ? { ignore: ignore.sort() } : {}), allow_fallbacks: false };
 }
