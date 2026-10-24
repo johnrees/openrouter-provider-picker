@@ -31,6 +31,8 @@ to `deepseek/deepseek-` and a second Tab lists the matches, and `opp v4-pro<Tab>
 comes from OpenRouter's public model list and is cached for a day in
 `$XDG_CACHE_HOME/opp/models.json`; a Tab press never waits more than two seconds.
 
+To highlight the current match as you press Tab, use zsh's menu selection: `zstyle ':completion:*' menu select` for every command, or `zstyle ':completion:*:*:opp:*' menu select` for `opp` only. It's a zsh setting that the completion script doesn't change.
+
 ## Use
 
 ```sh
