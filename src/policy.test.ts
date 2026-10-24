@@ -3,14 +3,18 @@ import { ep, fixtureRows } from "./fixtures.ts";
 import { isEndpoint } from "./openrouter.ts";
 import {
   type Endpoint,
+  freshProbes,
   ineligibleReasons,
   locationReasons,
   matchesProvider,
+  PROBE_TTL_DAYS,
   perMillion,
   pinRouting,
   quantLevel,
+  probeOverrides,
   rank,
   referenceRunCost,
+  toolChoiceSource,
   turnMs,
 } from "./policy.ts";
 
@@ -32,6 +36,54 @@ describe("eligibility", () => {
       supports_tool_choice: { none: true, auto: true, required: "yes" },
     });
     expect(ineligibleReasons(broken)).toEqual(["status -2", "no native tools", "tool_choice lacks required/function"]);
+  });
+});
+
+describe("probe results", () => {
+  const listedNo = ep("cf", { supports_tool_choice: { none: true, auto: true, required: false, function: true } });
+  const now = Date.parse("2026-10-24T00:00:00Z");
+  const daysAgo = (days: number) => new Date(now - days * 86_400_000).toISOString();
+
+  test("a pass makes a listed-no mode eligible, and the endpoint can be picked", () => {
+    expect(ineligibleReasons(listedNo, { required: "pass" })).toEqual([]);
+    const faster = { ...listedNo, latency_last_30m: { p50: 100 } };
+    expect(rank([ep("a"), faster]).map(({ endpoint }) => endpoint.tag)).toEqual(["a"]);
+    expect(rank([ep("a"), faster], new Map([["cf", { required: "pass" as const }]]))[0]?.endpoint.tag).toBe("cf");
+    expect(probeOverrides(listedNo, { required: "pass", auto: "pass" })).toEqual({ pass: ["required"], fail: [] });
+  });
+
+  test("a fail makes a listed-yes mode ineligible", () => {
+    expect(ineligibleReasons(ep("a"), { required: "fail" })).toEqual(["probed: required fail"]);
+    expect(ineligibleReasons(listedNo, { required: "fail", none: "fail" })).toEqual(["probed: none/required fail"]);
+    expect(probeOverrides(ep("a"), { required: "fail" })).toEqual({ pass: [], fail: ["required"] });
+  });
+
+  test("a probe overrides only tool_choice", () => {
+    const noTools = ep("a", { status: -2, supported_parameters: [] });
+    expect(ineligibleReasons(noTools, { none: "pass", auto: "pass", required: "pass", function: "pass" })).toEqual([
+      "status -2",
+      "no native tools",
+    ]);
+  });
+
+  test("results older than PROBE_TTL_DAYS are ignored", () => {
+    const store = {
+      "m/x": {
+        cf: {
+          required: { result: "pass" as const, at: daysAgo(PROBE_TTL_DAYS - 1) },
+          none: { result: "fail" as const, at: daysAgo(PROBE_TTL_DAYS + 1) },
+        },
+        old: { auto: { result: "pass" as const, at: daysAgo(30) } },
+      },
+    };
+    expect(freshProbes(store, "m/x", now)).toEqual(new Map([["cf", { required: "pass" }]]));
+    expect(freshProbes(store, "n/y", now)).toEqual(new Map());
+    expect(toolChoiceSource({ required: "pass" })).toEqual({
+      none: "listing",
+      auto: "listing",
+      required: "probe",
+      function: "listing",
+    });
   });
 });
 

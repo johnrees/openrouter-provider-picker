@@ -63,8 +63,11 @@ build `only: [tag]` from `--pick`.
 ## How it picks
 
 1. **Eligible:** native tools, status 0, and every `tool_choice` mode. Missing
-   `required` or `function` silently breaks agent loops. `--zdr`, `-e` and `-x`
-   also exclude here. Everything excluded is listed with its reasons.
+   `required` or `function` silently breaks agent loops. A `--probe` or
+   `--verify` result from the last 7 days overrides the listed `tool_choice`
+   support for that mode, in either direction, and the row is noted. `--zdr`,
+   `-e` and `-x` also exclude here. Everything excluded is listed with its
+   reasons.
 2. **Uptime first:** the last day, then the last 30 minutes. 98% or more counts
    as fully up.
 3. **Then speed:** estimated time for a 300-token agent turn (time to first
