@@ -1155,9 +1155,9 @@ describe("--probe", () => {
 describe("completion", () => {
   const MODELS = { data: [{ id: "deepseek/deepseek-v4-pro" }, { id: "z-ai/glm-5.3" }, { id: 7 }, { id: "bad slug" }] };
 
-  async function run(argv: string[], fetchImpl: () => Response | Promise<Response>) {
-    const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async () =>
-      fetchImpl()) as unknown as typeof fetch);
+  async function run(argv: string[], fetchImpl: (init?: RequestInit) => Response | Promise<Response>) {
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (_url: unknown, init?: RequestInit) =>
+      fetchImpl(init)) as unknown as typeof fetch);
     const log = spyOn(console, "log").mockImplementation(() => {});
     const error = spyOn(console, "error").mockImplementation(() => {});
     try {
@@ -1208,6 +1208,20 @@ describe("completion", () => {
     const refreshed = await run(["--list-models"], ok);
     expect(refreshed.stdout).toContain("z-ai/glm-5.3");
   });
+
+  test("a stalled fetch is abandoned after about two seconds and the stale cache is used", async () => {
+    const cache = process.env.XDG_CACHE_HOME!;
+    mkdirSync(join(cache, "opp"), { recursive: true });
+    writeFileSync(join(cache, "opp", "models.json"), JSON.stringify({ at: 0, slugs: ["old/model"] }));
+    const stalled = (init?: RequestInit) =>
+      new Promise<Response>((_, reject) =>
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true }),
+      );
+    const started = Date.now();
+    const out = await run(["--list-models"], stalled);
+    expect(out).toMatchObject({ code: 0, stdout: "old/model", stderr: "" });
+    expect(Date.now() - started).toBeLessThan(4000);
+  }, 10_000);
 
   test("with no cache and no network, --list-models prints nothing and no error", async () => {
     const out = await run(["--list-models"], down);
