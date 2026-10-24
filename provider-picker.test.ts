@@ -64,6 +64,11 @@ describe("parseOptions", () => {
     );
   });
 
+  test("the old --provider a b case is a valid two-value filter as --provider a --provider b", () => {
+    expect(parseOptions(["m/x", "--provider", "a", "--provider", "b"]).providers).toEqual(["a", "b"]);
+    expect(() => parseOptions(["m/x", "--provider", "a", "b"])).toThrow("did you mean -p b?");
+  });
+
   test("provider filters are split, trimmed and deduplicated", () => {
     expect(parseOptions(["m/x", "-p", "a,b", "-p", " c", "--provider", "a"]).providers).toEqual(["a", "b", "c"]);
   });
