@@ -795,6 +795,12 @@ describe("end to end against a mocked OpenRouter", () => {
       expect(json.stderr).toContain("$0.0010 spent on m/x, plus 1 request of unknown cost");
     });
 
+    test("sending stops once the reported spend reaches the cap", async () => {
+      const replies = routing([served("Together", { cost: 0.3 })]);
+      const { stdout } = await run(replies, ["m/x", "--audit-fallback", "5", "--json"]);
+      expect(JSON.parse(stdout).models[0]).toMatchObject({ auditUnsent: 3, auditUsd: 0.6 });
+    });
+
     test("a per-request fee counts toward the worst case", async () => {
       // Free tokens but $0.02 a request: 50 requests can cost $1.00.
       const list = [ep("fee", { pricing: { prompt: "0", completion: "0", request: "0.02" } }), ...endpoints];

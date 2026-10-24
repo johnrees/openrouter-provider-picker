@@ -92,7 +92,8 @@ Probes (paid requests):
                                 providers OpenRouter's default routing served and
                                 how many tool calls were unusable. -p, -e, -x and
                                 --zdr don't apply. Shows the worst-case cost first
-                                and refuses over $${AUDIT_MAX_USD.toFixed(2)}. Never changes the pick.
+                                and refuses over $${AUDIT_MAX_USD.toFixed(2)}; stops sending once the
+                                spend reaches it. Never changes the pick.
 
 Output:
       --json                    Print machine-readable results
@@ -236,7 +237,14 @@ async function probeTags(slug: string, tags: readonly string[], auth: Auth): Pro
   return ok;
 }
 
-type Context = { options: Options; auth?: Auth; locations?: Map<string, Location>; zdr?: Set<string> };
+/** `auditBudget` is what the audits of every model may still spend, shared so the cap holds on actual spend. */
+type Context = {
+  options: Options;
+  auth?: Auth;
+  locations?: Map<string, Location>;
+  zdr?: Set<string>;
+  auditBudget?: { usd: number };
+};
 
 const locationOf = (ep: Endpoint, { locations }: Context): Location | undefined => locations?.get(providerSlug(ep));
 
@@ -282,7 +290,7 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
  * Sends a report's paid requests: --verify first, since it decides the pick, then the audit in whatever is
  * left of the same time budget.
  */
-async function sendProbes(report: Report, { options, auth }: Context): Promise<Report> {
+async function sendProbes(report: Report, { options, auth, auditBudget }: Context): Promise<Report> {
   const n = options.auditFallback;
   if (report.error || !auth || (!options.verify && n === undefined)) return report;
   const deadline = Date.now() + VERIFY_BUDGET_MS;
@@ -290,7 +298,8 @@ async function sendProbes(report: Report, { options, auth }: Context): Promise<R
     options.verify && report.ranked.length
       ? await verify(report.slug, report.ranked, report.endpoints, auth, deadline)
       : undefined;
-  const audit = n === undefined ? undefined : await auditFallback(report.slug, n, report.endpoints, auth, deadline);
+  const audit =
+    n === undefined ? undefined : await auditFallback(report.slug, n, report.endpoints, auth, deadline, auditBudget);
   return { ...report, ...(verification && { verification }), ...(audit && { audit }) };
 }
 
@@ -655,6 +664,7 @@ export async function main(argv: string[]): Promise<number> {
 
   // Fetch every model concurrently, but print in argument order.
   const ctx: Context = {
+    auditBudget: { usd: AUDIT_MAX_USD },
     options,
     auth,
     locations: locations instanceof Error ? undefined : locations,

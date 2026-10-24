@@ -276,7 +276,8 @@ async function auditOne(
 
 /**
  * Sends `n` identical tool-call requests with no routing preferences, one at a time, and records which
- * provider OpenRouter's default routing served each. Requests not started by `deadline` stay unsent.
+ * provider OpenRouter's default routing served each. Requests not started by `deadline`, or once the reported
+ * spend has used up `budget` (which concurrent audits share), stay unsent.
  */
 export async function auditFallback(
   slug: string,
@@ -284,15 +285,17 @@ export async function auditFallback(
   endpoints: readonly Endpoint[],
   auth: Auth,
   deadline: number,
+  budget: { usd: number } = { usd: Infinity },
 ): Promise<Audit> {
   const samples: AuditSample[] = [];
   let usd = 0;
   let uncosted = 0;
-  while (samples.length < n && Date.now() < deadline) {
+  while (samples.length < n && Date.now() < deadline && budget.usd > 0) {
     const outcome = await auditOne(slug, endpoints, auth);
     samples.push(outcome.sample);
     if (outcome.usd === undefined) uncosted += 1;
     else usd += outcome.usd;
+    budget.usd -= outcome.usd ?? 0;
   }
   return { samples, unsent: n - samples.length, usd, uncosted };
 }
