@@ -28,6 +28,7 @@ opp z-ai/glm-5.3 --pick     # just the chosen endpoint tag, e.g. wafer/us
 opp z-ai/glm-5.3 --verify   # prove the pick serves and makes a tool call
 opp z-ai/glm-5.3 --zdr      # zero-data-retention endpoints only
 opp z-ai/glm-5.3 -x RU      # drop providers headquartered or hosting in Russia
+opp z-ai/glm-5.3 -e inference-net  # never rank or pick InferenceNet
 opp z-ai/glm-5.3 -p baseten # only BaseTen's endpoints
 opp z-ai/glm-5.3 --json     # machine-readable
 ```
@@ -60,8 +61,8 @@ build `only: [tag]` from `--pick`.
 ## How it picks
 
 1. **Eligible:** native tools, status 0, and every `tool_choice` mode. Missing
-   `required` or `function` silently breaks agent loops. `--zdr` and `-x` also
-   exclude here. Everything excluded is listed with its reasons.
+   `required` or `function` silently breaks agent loops. `--zdr`, `-e` and `-x`
+   also exclude here. Everything excluded is listed with its reasons.
 2. **Uptime first:** the last day, then the last 30 minutes. 98% or more counts
    as fully up.
 3. **Then speed:** estimated time for a 300-token agent turn (time to first
