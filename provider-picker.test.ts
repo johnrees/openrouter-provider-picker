@@ -927,13 +927,24 @@ describe("--probe", () => {
     expect((await run(["m/x", "--probe", "cf"], (mode) => (mode === "auto" ? invented : good(mode)))).code).toBe(1);
     for (const choice of [
       {},
-      { finish_reason: "length", message: { content: null } },
+      {
+        finish_reason: "length",
+        message: { content: null, tool_calls: [{ function: { name: "ok", arguments: "{" } }] },
+      },
       { finish_reason: "error", message: { content: null } },
       { finish_reason: "tool_calls", message: { content: null, tool_calls: [] } },
     ]) {
       const truncated = { provider: "Cloudflare", choices: [choice] };
       expect((await run(["m/x", "--probe", "cf"], (mode) => (mode === "none" ? truncated : good(mode)))).code).toBe(1);
     }
+  });
+
+  test("a plain reply cut off by max_tokens still passes none and auto", async () => {
+    const cut = { provider: "Cloudflare", choices: [{ finish_reason: "length", message: { content: "hi" } }] };
+    const { code } = await run(["m/x", "--probe", "cf"], (mode) =>
+      mode === "none" || mode === "auto" ? cut : good(mode),
+    );
+    expect(code).toBe(0);
   });
 
   test("an unknown tag exits 1 without requests", async () => {

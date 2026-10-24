@@ -610,8 +610,11 @@ async function attempt(
       : undefined;
     // "none" passes on a plain reply, and any tool call then breaks the contract. "auto" may or may not call,
     // but a call it makes must be usable. Both need a completion to judge.
-    // A finished reply has a message and ended normally, not on length, an error or a filter.
-    if ((mode === "none" || mode === "auto") && (!choice?.message || !["stop", "tool_calls"].includes(finish))) {
+    // A finished reply has a message and did not end on an error or a filter. A reply cut off by max_tokens still passes: length is no tool_choice failure.
+    if (
+      (mode === "none" || mode === "auto") &&
+      (!choice?.message || !["stop", "tool_calls", "length"].includes(finish))
+    ) {
       return result(false, `no finished completion, finish=${finish}`);
     }
     if (mode === "none") {
