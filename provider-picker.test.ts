@@ -245,7 +245,22 @@ describe("pinning", () => {
   });
 
   test("routing pins the exact endpoint with no fallback", () => {
-    expect(pinRouting(ep("baseten/fp4/us"))).toEqual({ only: ["baseten/fp4/us"], allow_fallbacks: false });
+    const endpoint = ep("baseten/fp4/us");
+    expect(pinRouting(endpoint, [ep("baseten/fp4"), endpoint])).toEqual({
+      only: ["baseten/fp4/us"],
+      allow_fallbacks: false,
+    });
+  });
+
+  test("routing ignores every longer tag the pin would match by prefix", () => {
+    const list = [ep("fireworks"), ep("fireworks/spot"), ep("fireworks/fast"), ep("fireworks-ai"), ep("other")];
+    expect(pinRouting(list[0]!, list)).toEqual({
+      only: ["fireworks"],
+      ignore: ["fireworks/fast", "fireworks/spot"],
+      allow_fallbacks: false,
+    });
+    expect(pinRouting(list[1]!, list)).toEqual({ only: ["fireworks/spot"], allow_fallbacks: false });
+    expect("ignore" in pinRouting(list[1]!, list)).toBe(false);
   });
 });
 
@@ -297,6 +312,9 @@ describe("secrets", () => {
     expect(isEndpoint(ep("ok"))).toBe(true);
     expect(isEndpoint(ep("ok", { quantization: "fp8" }))).toBe(true);
     expect(isEndpoint(ep("ok", { quantization: "fp8\u001b[2J" }))).toBe(false);
+    expect(isEndpoint(ep("ok", { service_tier: "priority" }))).toBe(true);
+    expect(isEndpoint(ep("ok", { service_tier: "priority\u001b[2J" }))).toBe(false);
+    expect(isEndpoint(ep("ok", { service_tier: 1 as unknown as string }))).toBe(false);
     expect(isEndpoint(ep("ok", { status: "0\u001b[2J" as unknown as number }))).toBe(false);
     expect(isEndpoint(ep("bad\ntag"))).toBe(false);
   });
@@ -546,6 +564,48 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(retryDelay(null)).toBe(2_000);
     expect(retryDelay("")).toBe(2_000);
     expect(retryDelay("Wed, 21 Oct 2026 07:28:00 GMT")).toBe(2_000);
+  });
+
+  describe("a provider with tier and sibling endpoints", () => {
+    // "fireworks" ranks first. Its pin would match both longer tags, the
+    // ineligible priority tier among them.
+    const list = [
+      ep("fireworks", { latency_last_30m: { p50: 100 } }),
+      ep("fireworks/spot"),
+      ep("fireworks/fast", { status: -1, service_tier: "priority" }),
+    ];
+    const pinned = { only: ["fireworks"], ignore: ["fireworks/fast", "fireworks/spot"], allow_fallbacks: false };
+    const reply = (tier: string) =>
+      new Response(JSON.stringify({ provider: "Fireworks", service_tier: tier, choices: [TOOL_CALL] }));
+
+    test("the probe ignores the siblings, and a reply from the wrong tier fails it", async () => {
+      const { code, output, probes } = await run(
+        (tag) => reply(tag === "fireworks" ? "priority" : "default"),
+        undefined,
+        ZDR_LIST,
+        { list },
+      );
+      expect(probes.map(({ provider }) => provider)).toEqual([
+        pinned,
+        { only: ["fireworks/spot"], allow_fallbacks: false },
+      ]);
+      expect(output).toContain("probe fireworks: FAILED (served at tier priority, expected default)");
+      expect(output).toContain("probe fireworks/spot: ok");
+      expect(output).toContain(
+        `routing: "provider": ${JSON.stringify({ only: ["fireworks/spot"], allow_fallbacks: false })}`,
+      );
+      expect(code).toBe(0);
+    });
+
+    test("the printed routing matches the probe's, even for siblings filtered out", async () => {
+      const verified = await run(() => reply("default"), ["m/x", "--json", "--verify"], ZDR_LIST, { list });
+      expect(verified.probes[0].provider).toEqual(pinned);
+      expect(JSON.parse(verified.stdout).models[0].pick.routing).toEqual(pinned);
+      // --zdr drops both siblings from the ranking, but OpenRouter could still route to them.
+      const zdrList = { data: [{ model_id: "m/x", tag: "fireworks" }] };
+      const { stdout } = await run(() => undefined, ["m/x", "--zdr"], zdrList, { list });
+      expect(stdout).toContain(`routing: "provider": ${JSON.stringify(pinned)}`);
+    });
   });
 
   test("the key goes only where it is needed and is never printed", async () => {
