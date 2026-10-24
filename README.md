@@ -43,13 +43,19 @@ is only sent to openrouter.ai and never printed.
 Put the printed routing in your request:
 
 ```json
-{ "model": "z-ai/glm-5.3", "provider": { "only": ["wafer/us"], "allow_fallbacks": false } }
+{
+  "model": "z-ai/glm-5.3",
+  "provider": { "only": ["fireworks"], "ignore": ["fireworks/fast", "fireworks/spot"], "allow_fallbacks": false }
+}
 ```
 
-Pin by endpoint **tag** (`wafer/us`), not provider name: one provider often
+Pin by endpoint **tag** (`fireworks`), not provider name: one provider often
 runs several endpoints of a model at different quantizations and prices. A
 `model:provider` suffix such as `z-ai/glm-5.3:Together` does nothing;
-OpenRouter ignores it.
+OpenRouter ignores it. OpenRouter's `only` matches every endpoint whose tag
+starts with the pinned tag plus `/`, so `opp` lists those in `ignore`. Scripts
+should take the routing from `--json` (`.models[].pick.routing`) rather than
+build `only: [tag]` from `--pick`.
 
 ## How it picks
 

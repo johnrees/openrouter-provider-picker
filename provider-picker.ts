@@ -9,7 +9,7 @@
  * This tool ranks every endpoint of a model under an explicit policy and
  * prints the request routing that pins the winner with no fallback:
  *
- *   "provider": { "only": ["<endpoint tag>"], "allow_fallbacks": false }
+ *   "provider": { "only": ["<endpoint tag>"], "ignore": ["<longer sibling tags>"], "allow_fallbacks": false }
  *
  * README.md explains the policy. Run with --help for usage.
  */
@@ -107,6 +107,8 @@ export type Endpoint = {
   tag: string;
   status?: number | null;
   quantization?: string | null;
+  /** "priority", "flex" or "ultrafast" for a tier endpoint; null for a standard one. */
+  service_tier?: string | null;
   max_completion_tokens?: number | null;
   supported_parameters: string[];
   supports_tool_choice?: Partial<Record<ToolChoiceMode, unknown>> | null;
@@ -134,6 +136,8 @@ type Report = {
   error?: string;
   total: number;
   malformed: number;
+  /** Every well-formed endpoint of the model, filtered or not: any of them can match a pin. */
+  endpoints: Endpoint[];
   ranked: Ranked[];
   ineligible: { endpoint: Endpoint; reasons: string[] }[];
   verification?: Verification;
@@ -315,9 +319,14 @@ export function matchesProvider(ep: Endpoint, filter: string): boolean {
 /**
  * The `provider` object for a chat request that pins this one endpoint. A
  * `model:provider` suffix does not do this: OpenRouter ignores it and routes
- * as usual.
+ * as usual. `only` matches by prefix, so a pin on "fireworks" also matches
+ * "fireworks/fast"; `ignore` lists every such longer tag among `endpoints`
+ * and is left out when there is none.
  */
-export const pinRouting = (ep: Endpoint) => ({ only: [ep.tag], allow_fallbacks: false });
+export function pinRouting(ep: Endpoint, endpoints: readonly Endpoint[]) {
+  const ignore = endpoints.map(({ tag }) => tag).filter((tag) => tag.startsWith(`${ep.tag}/`));
+  return { only: [ep.tag], ...(ignore.length ? { ignore: ignore.sort() } : {}), allow_fallbacks: false };
+}
 
 // ---- Auth and output hygiene ------------------------------------------------
 
@@ -386,6 +395,7 @@ export function isEndpoint(value: unknown): value is Endpoint {
     typeof ep.tag === "string" &&
     PRINTABLE.test(ep.tag) &&
     isLabel(ep.quantization) &&
+    isLabel(ep.service_tier) &&
     (ep.status == null || Number.isInteger(ep.status)) &&
     Array.isArray(ep.supported_parameters) &&
     ep.supported_parameters.every((p) => typeof p === "string") &&
@@ -455,6 +465,7 @@ async function fetchZdr(): Promise<Set<string>> {
 
 type ChatResponse = {
   provider?: unknown;
+  service_tier?: unknown;
   error?: { message?: unknown; code?: unknown };
   choices?: { finish_reason?: unknown; message?: { tool_calls?: unknown } }[];
 };
@@ -489,16 +500,16 @@ export function retryDelay(header: string | null): number {
  * real request is the only way to learn whether this account can use an
  * endpoint.
  */
-async function probe(slug: string, ep: Endpoint, auth: Auth): Promise<Probe> {
-  const first = await attempt(slug, ep, auth);
+async function probe(slug: string, ep: Endpoint, endpoints: readonly Endpoint[], auth: Auth): Promise<Probe> {
+  const first = await attempt(slug, ep, endpoints, auth);
   if (first.retryInMs === undefined) return { endpoint: ep, ok: first.ok, busy: false, detail: first.detail };
   await Bun.sleep(first.retryInMs);
-  const second = await attempt(slug, ep, auth);
+  const second = await attempt(slug, ep, endpoints, auth);
   const busy = second.retryInMs !== undefined;
   return { endpoint: ep, ok: second.ok, busy, detail: `${second.detail}, ${second.ok ? "after a retry" : "retried"}` };
 }
 
-async function attempt(slug: string, ep: Endpoint, auth: Auth): Promise<Attempt> {
+async function attempt(slug: string, ep: Endpoint, endpoints: readonly Endpoint[], auth: Auth): Promise<Attempt> {
   const result = (ok: boolean, detail: string, retryInMs?: number): Attempt => ({
     ok,
     detail: sanitize(detail, auth.key),
@@ -512,7 +523,7 @@ async function attempt(slug: string, ep: Endpoint, auth: Auth): Promise<Attempt>
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       body: JSON.stringify({
         model: slug,
-        provider: pinRouting(ep),
+        provider: pinRouting(ep, endpoints),
         max_tokens: PROBE_MAX_TOKENS,
         // Eligibility trusts the endpoint's advertised tool support, so the probe exercises it.
         tools: [{ type: "function", function: { name: PROBE_TOOL, parameters: { type: "object", properties: {} } } }],
@@ -531,6 +542,10 @@ async function attempt(slug: string, ep: Endpoint, auth: Auth): Promise<Attempt>
     // Pinning makes this unreachable unless OpenRouter changes semantics. Check anyway, since verifying is the point.
     const servedBy = typeof body?.provider === "string" ? body.provider : "an unknown provider";
     if (servedBy.toLowerCase() !== ep.provider_name.toLowerCase()) return result(false, `served by ${servedBy}`);
+    // A provider's tier endpoints share its name, so check the tier too. Responses call the standard tier "default".
+    const tier = body?.service_tier;
+    const want = ep.service_tier ?? "default";
+    if (typeof tier === "string" && tier !== want) return result(false, `served at tier ${tier}, expected ${want}`);
     const choice = body?.choices?.[0];
     const finish = String(choice?.finish_reason ?? "none");
     const calls = choice?.message?.tool_calls;
@@ -551,12 +566,17 @@ async function attempt(slug: string, ep: Endpoint, auth: Auth): Promise<Attempt>
 }
 
 /** Probes candidates in rank order and stops at the first that serves. */
-async function verify(slug: string, candidates: readonly Ranked[], auth: Auth): Promise<Verification> {
+async function verify(
+  slug: string,
+  candidates: readonly Ranked[],
+  endpoints: readonly Endpoint[],
+  auth: Auth,
+): Promise<Verification> {
   const deadline = Date.now() + VERIFY_BUDGET_MS;
   const probes: Probe[] = [];
   for (const { endpoint } of candidates) {
     if (Date.now() >= deadline) return { probes, unprobed: candidates.length - probes.length };
-    const outcome = await probe(slug, endpoint, auth);
+    const outcome = await probe(slug, endpoint, endpoints, auth);
     probes.push(outcome);
     if (outcome.ok) return { probes, verified: endpoint };
   }
@@ -589,14 +609,16 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
       .filter(kept)
       .map((endpoint) => ({ endpoint, reasons: [...ineligibleReasons(endpoint), ...excludedBy(endpoint)] }))
       .filter(({ reasons }) => reasons.length);
-    const verification = options.verify && auth && ranked.length ? await verify(slug, ranked, auth) : undefined;
-    return { slug, total: endpoints.length, malformed, ranked, ineligible, verification };
+    const verification =
+      options.verify && auth && ranked.length ? await verify(slug, ranked, endpoints, auth) : undefined;
+    return { slug, total: endpoints.length, malformed, endpoints, ranked, ineligible, verification };
   } catch (error) {
     return {
       slug,
       error: sanitize(errorMessage(error), auth?.key),
       total: 0,
       malformed: 0,
+      endpoints: [],
       ranked: [],
       ineligible: [],
     };
@@ -738,7 +760,7 @@ function renderReport(report: Report, ctx: Context): string {
   if (pick) {
     lines.push(
       `  ${report.verification ? "verified pin" : "pin"}: ${report.slug}:${pick.tag}`,
-      `  routing: "provider": ${JSON.stringify(pinRouting(pick))}`,
+      `  routing: "provider": ${JSON.stringify(pinRouting(pick, report.endpoints))}`,
     );
     const note = busyNote(report);
     if (note) lines.push(`  note: ${note}`);
@@ -767,7 +789,7 @@ function reportJson(report: Report, ctx: Context) {
           pin: `${report.slug}:${pick.tag}`,
           endpoint: pick.tag,
           provider: pick.provider_name,
-          routing: pinRouting(pick),
+          routing: pinRouting(pick, report.endpoints),
           verified: report.verification !== undefined,
         }
       : null,
@@ -887,6 +909,14 @@ export async function main(argv: string[]): Promise<number> {
       const pick = pickOf(report);
       if (pick) {
         console.log(pick.tag);
+        // A script that builds `only: [tag]` from this alone would let the pin's siblings serve it.
+        const { ignore } = pinRouting(pick, report.endpoints);
+        if (ignore) {
+          console.error(
+            `${NAME}: ${report.slug}: pin needs ignore [${ignore.join(", ")}]; ` +
+              "take routing from --json .models[].pick.routing",
+          );
+        }
         const note = busyNote(report);
         if (note) console.error(`${NAME}: ${report.slug}: picked ${pick.tag}, but ${note}`);
       } else {
