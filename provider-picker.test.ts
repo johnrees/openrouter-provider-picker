@@ -46,7 +46,7 @@ describe("parseOptions", () => {
   test("defaults", () => {
     expect(parseOptions(["z-ai/glm-5.3"])).toEqual({
       slugs: ["z-ai/glm-5.3"],
-      provider: undefined,
+      providers: [],
       excludeProviders: [],
       excludeCountries: [],
       zdr: false,
@@ -58,11 +58,14 @@ describe("parseOptions", () => {
     });
   });
 
-  test("words with a slash are models, a bare word is the provider filter", () => {
-    const options = parseOptions(["z-ai/glm-5.3", "together", "--verify"]);
-    expect(options.slugs).toEqual(["z-ai/glm-5.3"]);
-    expect(options.provider).toBe("together");
-    expect(options.verify).toBe(true);
+  test("a bare word is not a model: it is an error that suggests -p", () => {
+    expect(() => parseOptions(["z-ai/glm-5.3", "together", "--verify"])).toThrow(
+      "together: not a model slug; did you mean -p together?",
+    );
+  });
+
+  test("provider filters are split, trimmed and deduplicated", () => {
+    expect(parseOptions(["m/x", "-p", "a,b", "-p", " c", "--provider", "a"]).providers).toEqual(["a", "b", "c"]);
   });
 
   test("--help needs no model", () => {
@@ -84,14 +87,16 @@ describe("parseOptions", () => {
   test.each([
     [["m/x", "-e", ""], /excluded provider must not be empty/],
     [["m/x", "-e", "a,,b"], /excluded provider must not be empty/],
-    [["--provider", "a", "b"], /at most one provider filter/],
-    [["--provider", " "], /must not be empty/],
+    [["m/x", "-p", ""], /provider filter must not be empty/],
+    [["m/x", "-p", "a,,b"], /provider filter must not be empty/],
+    [["m/x", "-p", " "], /provider filter must not be empty/],
+    [["m/x", "-x", "CN,"], /excluded country must not be empty/],
     [["../etc/passwd"], /not a model slug/],
     [["a/.."], /not a model slug/],
     [["m/x", "-x", "china"], /two-letter country code/],
     [["--json", "--pick"], /alternative outputs/],
     [[], /at least one model slug/],
-    [["together"], /at least one model slug/],
+    [["together"], /did you mean -p together\?/],
     [["--nope"], /Unknown option/],
   ])("rejects %j", (argv, message) => {
     expect(() => parseOptions(argv)).toThrow(message);
@@ -345,7 +350,13 @@ describe("main", () => {
       expect(await main(["--bogus"])).toBe(2);
       expect(await main([])).toBe(2);
       expect(await main(["--help"])).toBe(0);
-      expect(log.mock.calls[0]?.[0]).toContain("--exclude-country");
+      const help = String(log.mock.calls[0]?.[0]);
+      const headings = ["Models:", "Eligibility:", "Probes (", "Output:", "Auth:", "Exit status:"];
+      const at = headings.map((heading) => help.indexOf(`\n${heading}`));
+      expect(at.every((index) => index > 0)).toBe(true);
+      expect(at).toEqual([...at].sort((a, b) => a - b));
+      expect(help.slice(at[1], at[2])).toContain("--exclude-country");
+      expect(help.slice(at[2], at[3])).toContain("--probe");
     } finally {
       error.mockRestore();
       log.mockRestore();
@@ -732,6 +743,18 @@ describe("end to end against a mocked OpenRouter", () => {
     const ranked = JSON.parse(stdout).models[0].ranked;
     expect(ranked.map(({ endpoint }: { endpoint: string }) => endpoint)).toEqual(["pricey"]);
     expect(ranked[0].priceEliminated).toBe(true);
+  });
+
+  test("-p with several values keeps endpoints of any of them; the price guard still sees every endpoint", async () => {
+    const pricey = { prompt: "0.00001", input_cache_read: "0.000001", completion: "0.00004" };
+    const list = [ep("cheap"), ep("pricey", { pricing: pricey }), ep("other", { pricing: pricey })];
+    const { stdout } = await run(() => undefined, ["m/x", "--json", "-p", "pricey,cheap", "-p", "nomatch"], ZDR_LIST, {
+      list,
+    });
+    const ranked = JSON.parse(stdout).models[0].ranked;
+    expect(ranked.map(({ endpoint }: { endpoint: string }) => endpoint).sort()).toEqual(["cheap", "pricey"]);
+    expect(ranked.find(({ endpoint }: { endpoint: string }) => endpoint === "pricey").priceEliminated).toBe(true);
+    expect(ranked.find(({ endpoint }: { endpoint: string }) => endpoint === "cheap").priceEliminated).toBe(false);
   });
 
   test("without --zdr, a faster non-ZDR endpoint still wins", async () => {
