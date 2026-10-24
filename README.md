@@ -75,7 +75,7 @@ build `only: [tag]` from `--pick`.
 
 Quantization is shown but never ranked. ZDR status is shown too, and only
 counts with `--zdr`. The thresholds are constants at the top of
-`provider-picker.ts`.
+`src/policy.ts`.
 
 ## Development
 
