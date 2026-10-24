@@ -690,7 +690,7 @@ describe("end to end against a mocked OpenRouter", () => {
     expect((await run(() => undefined, ["m/x", "--pick", "-e", "TOGETHER"])).stdout).toBe("wafer/us");
     const { stdout } = await run(() => undefined, ["m/x", "-e", "together"]);
     expect(stdout).toMatch(/together .*excluded: together/);
-    expect(stdout).toContain("not provider ~ together");
+    expect(stdout).toContain(", excluding together");
     const { probes } = await run(
       (tag) => (tag === "wafer/us" ? "Wafer" : undefined),
       ["m/x", "--verify", "-e", "together"],
@@ -702,6 +702,18 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(json.models[0].ineligible).toContainEqual(
       expect.objectContaining({ endpoint: "together", reasons: ["excluded: together"] }),
     );
+  });
+
+  test("-e removes the excluded endpoint from the price guard's baseline", async () => {
+    const cheap = { prompt: "0.000001", input_cache_read: "0.0000001", completion: "0.000004" };
+    const costly = { prompt: "0.00001", input_cache_read: "0.000001", completion: "0.00004" };
+    const list = [
+      ep("cheap", { pricing: cheap }),
+      ep("costly", { pricing: costly }),
+      ep("flaky", { pricing: cheap, uptime_last_1d: 90, uptime_last_30m: 90 }),
+    ];
+    expect((await run(() => undefined, ["m/x", "--pick"], ZDR_LIST, { list })).stdout).toBe("cheap");
+    expect((await run(() => undefined, ["m/x", "--pick", "-e", "cheap"], ZDR_LIST, { list })).stdout).toBe("costly");
   });
 
   test("-e wins over -p when an endpoint matches both", async () => {

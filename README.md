@@ -28,7 +28,7 @@ opp z-ai/glm-5.3 --pick     # just the chosen endpoint tag, e.g. wafer/us
 opp z-ai/glm-5.3 --verify   # prove the pick serves and makes a tool call
 opp z-ai/glm-5.3 --zdr      # zero-data-retention endpoints only
 opp z-ai/glm-5.3 -x RU      # drop providers headquartered or hosting in Russia
-opp z-ai/glm-5.3 -e novita  # never pick a provider (repeat or comma-separate)
+opp z-ai/glm-5.3 -e inference-net  # never rank or pick InferenceNet
 opp z-ai/glm-5.3 -p baseten # only BaseTen's endpoints
 opp z-ai/glm-5.3 --json     # machine-readable
 ```

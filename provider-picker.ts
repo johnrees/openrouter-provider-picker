@@ -73,14 +73,14 @@ Options:
   -p, --provider <name>       Keep endpoints whose provider name or tag
                               contains <name>, case-insensitively. A bare word
                               without "/" works too: z-ai/glm-5.3 together
-  -e, --exclude-provider <name>
-                              Drop endpoints whose provider name or tag contains
-                              <name>, matched like -p (repeatable or
-                              comma-separated: -e deepinfra,novita). Wins over -p.
   -x, --exclude-country <CC>  Drop endpoints whose provider is headquartered or
                               has a datacenter in this ISO country (repeatable
                               or comma-separated: -x CN,RU). Providers with no
                               known location are kept and shown with "?".
+  -e, --exclude-provider <name>
+                              Drop endpoints whose provider name or tag contains
+                              <name>, matched like -p (repeatable or
+                              comma-separated: -e deepinfra,novita). Wins over -p.
       --zdr                   Keep only zero-data-retention endpoints, per
                               OpenRouter's ZDR list. The zdr column shows each
                               endpoint's status either way.
@@ -957,7 +957,7 @@ export async function main(argv: string[]): Promise<number> {
     console.log(`# OpenRouter endpoint ranking · ${new Date().toISOString()} · auth: ${auth?.source ?? "anonymous"}`);
     console.log(
       `# eligible: native tools, status 0, tool_choice ${TOOL_CHOICE_MODES.join("/")}` +
-        (options.excludeProviders.length ? `, not provider ~ ${options.excludeProviders.join("/")}` : "") +
+        (options.excludeProviders.length ? `, excluding ${options.excludeProviders.join(", ")}` : "") +
         (options.excludeCountries.length ? `, not in ${options.excludeCountries.join("/")}` : "") +
         (options.zdr ? ", ZDR only" : ""),
     );
