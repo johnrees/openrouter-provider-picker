@@ -513,7 +513,7 @@ function isArgumentObject(args: unknown): boolean {
 /** A tool call with a name and arguments an agent can parse. */
 const usableCall = (c: unknown): boolean => {
   const fn = (c as { function?: { name?: unknown; arguments?: unknown } } | null)?.function;
-  return typeof fn?.name === "string" && isArgumentObject(fn.arguments);
+  return fn?.name === PROBE_TOOL && isArgumentObject(fn.arguments);
 };
 
 /** One probe request's outcome. `retryInMs` is set when the failure is transient. */
@@ -610,7 +610,10 @@ async function attempt(
       : undefined;
     // "none" passes on a plain reply, and any tool call then breaks the contract. "auto" may or may not call,
     // but a call it makes must be usable. Both need a completion to judge.
-    if ((mode === "none" || mode === "auto") && !choice) return result(false, `no completion in the reply`);
+    // A finished reply has a message and a finish reason other than running out of tokens.
+    if ((mode === "none" || mode === "auto") && (!choice?.message || !choice.finish_reason || finish === "length")) {
+      return result(false, `no finished completion, finish=${finish}`);
+    }
     if (mode === "none") {
       return Array.isArray(calls) && calls.length
         ? result(false, `tool call despite tool_choice none, finish=${finish}`)

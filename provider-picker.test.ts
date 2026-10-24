@@ -918,6 +918,17 @@ describe("--probe", () => {
     const broken = await run(["m/x", "--probe", "cf"], (mode) => (mode === "auto" ? badArgs : good(mode)));
     expect(broken.code).toBe(1);
     expect(broken.stdout).toContain("cf  auto  fail  listed: yes  unusable tool call");
+    const invented = {
+      ...badArgs,
+      choices: [
+        { finish_reason: "tool_calls", message: { tool_calls: [{ function: { name: "nope", arguments: "{}" } }] } },
+      ],
+    };
+    expect((await run(["m/x", "--probe", "cf"], (mode) => (mode === "auto" ? invented : good(mode)))).code).toBe(1);
+    for (const choice of [{}, { finish_reason: "length", message: { content: null } }]) {
+      const truncated = { provider: "Cloudflare", choices: [choice] };
+      expect((await run(["m/x", "--probe", "cf"], (mode) => (mode === "none" ? truncated : good(mode)))).code).toBe(1);
+    }
   });
 
   test("an unknown tag exits 1 without requests", async () => {
