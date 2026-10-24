@@ -757,6 +757,11 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(ranked.find(({ endpoint }: { endpoint: string }) => endpoint === "cheap").priceEliminated).toBe(false);
   });
 
+  test("-p lists every value when nothing matches", async () => {
+    const { stdout } = await run(() => undefined, ["m/x", "-p", "absent,missing"]);
+    expect(stdout).toContain("no eligible endpoint matches absent, missing");
+  });
+
   test("without --zdr, a faster non-ZDR endpoint still wins", async () => {
     const { stdout } = await run(() => undefined, ["m/x", "--pick"]);
     expect(stdout).toBe("together");
