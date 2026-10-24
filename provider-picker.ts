@@ -510,6 +510,12 @@ function isArgumentObject(args: unknown): boolean {
   }
 }
 
+/** A tool call with a name and arguments an agent can parse. */
+const usableCall = (c: unknown): boolean => {
+  const fn = (c as { function?: { name?: unknown; arguments?: unknown } } | null)?.function;
+  return typeof fn?.name === "string" && isArgumentObject(fn.arguments);
+};
+
 /** One probe request's outcome. `retryInMs` is set when the failure is transient. */
 type Attempt = { ok: boolean; detail: string; retryInMs?: number };
 
@@ -602,13 +608,20 @@ async function attempt(
           (c) => c?.function?.name === PROBE_TOOL,
         )
       : undefined;
-    // "none" passes on a plain reply, and any tool call then breaks the contract. "auto" may or may not call.
+    // "none" passes on a plain reply, and any tool call then breaks the contract. "auto" may or may not call,
+    // but a call it makes must be usable. Both need a completion to judge.
+    if ((mode === "none" || mode === "auto") && !choice) return result(false, `no completion in the reply`);
     if (mode === "none") {
       return Array.isArray(calls) && calls.length
         ? result(false, `tool call despite tool_choice none, finish=${finish}`)
         : result(true, `served by ${servedBy}, no tool call, finish=${finish}`);
     }
-    if (mode === "auto") return result(true, `served by ${servedBy}, finish=${finish}`);
+    if (mode === "auto") {
+      const bad = Array.isArray(calls) && calls.length && (finish === "length" || !calls.every(usableCall));
+      return bad
+        ? result(false, `unusable tool call, finish=${finish}`)
+        : result(true, `served by ${servedBy}, finish=${finish}`);
+    }
     if (!call) return result(false, `no ${PROBE_TOOL} tool call despite tool_choice ${mode}, finish=${finish}`);
     // A call cut off by max_tokens, or with arguments an agent can't parse, is no use to an agent loop.
     if (finish === "length" || !isArgumentObject(call.function?.arguments)) {

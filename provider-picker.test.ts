@@ -902,6 +902,24 @@ describe("--probe", () => {
     expect(missing.stdout).toContain("no ok tool call despite tool_choice function, finish=stop");
   });
 
+  test("none and auto need a completion, and an auto tool call must be usable", async () => {
+    const empty = { provider: "Cloudflare", choices: [] };
+    const none = await run(["m/x", "--probe", "cf"], (mode) => (mode === "none" ? empty : good(mode)));
+    expect(none.code).toBe(1);
+    expect(none.stdout).toContain("cf  none  fail");
+    const auto = await run(["m/x", "--probe", "cf"], (mode) => (mode === "auto" ? empty : good(mode)));
+    expect(auto.code).toBe(1);
+    const badArgs = {
+      provider: "Cloudflare",
+      choices: [
+        { finish_reason: "tool_calls", message: { tool_calls: [{ function: { name: "ok", arguments: "{oops" } }] } },
+      ],
+    };
+    const broken = await run(["m/x", "--probe", "cf"], (mode) => (mode === "auto" ? badArgs : good(mode)));
+    expect(broken.code).toBe(1);
+    expect(broken.stdout).toContain("cf  auto  fail  listed: yes  unusable tool call");
+  });
+
   test("an unknown tag exits 1 without requests", async () => {
     const { code, bodies, stdout } = await run(["m/x", "--probe", "nope"], good);
     expect(code).toBe(1);
