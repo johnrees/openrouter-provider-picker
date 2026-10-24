@@ -238,7 +238,7 @@ async function auditOne(
   slug: string,
   endpoints: readonly Endpoint[],
   auth: Auth,
-): Promise<{ sample: AuditSample; usd: number }> {
+): Promise<{ sample: AuditSample; usd: number | undefined }> {
   const started = performance.now();
   const sample = (body: ChatResponse | null, served: boolean): AuditSample => {
     const provider = served && typeof body?.provider === "string" ? body.provider : null;
@@ -262,12 +262,15 @@ async function auditOne(
       body: JSON.stringify(probeBody(slug, null, endpoints, "required")),
     });
     const body = (await res.json().catch(() => null)) as ChatResponse | null;
-    const cost = body?.usage?.cost;
-    const usd = typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : 0;
     // OpenRouter can also report an upstream failure as an error body on a 200.
-    return { sample: sample(body, res.ok && body?.error?.message == null), usd };
+    const served = res.ok && body?.error?.message == null;
+    const cost = body?.usage?.cost;
+    const known = typeof cost === "number" && Number.isFinite(cost) && cost >= 0;
+    // A failure OpenRouter answered is not billed; a served response without a cost is unknown, not free.
+    return { sample: sample(body, served), usd: known ? cost : served ? undefined : 0 };
   } catch {
-    return { sample: sample(null, false), usd: 0 };
+    // A timeout or dropped connection may still have been billed upstream.
+    return { sample: sample(null, false), usd: undefined };
   }
 }
 
@@ -284,10 +287,12 @@ export async function auditFallback(
 ): Promise<Audit> {
   const samples: AuditSample[] = [];
   let usd = 0;
+  let uncosted = 0;
   while (samples.length < n && Date.now() < deadline) {
     const outcome = await auditOne(slug, endpoints, auth);
     samples.push(outcome.sample);
-    usd += outcome.usd;
+    if (outcome.usd === undefined) uncosted += 1;
+    else usd += outcome.usd;
   }
-  return { samples, unsent: n - samples.length, usd };
+  return { samples, unsent: n - samples.length, usd, uncosted };
 }

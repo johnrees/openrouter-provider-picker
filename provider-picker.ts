@@ -479,8 +479,13 @@ function renderReport(report: Report, ctx: Context): string {
 /** Dollars to the cent, or to a hundredth of a cent below ten cents. */
 const fmtUsd = (usd: number): string => `$${usd.toFixed(usd >= 0.1 ? 2 : 4)}`;
 
+/** What an audit spent, and how many of its requests reported no cost. */
+const spent = ({ usd, uncosted }: Audit, where = ""): string =>
+  `${fmtUsd(usd)} spent${where}${uncosted ? `, plus ${uncosted} request${uncosted === 1 ? "" : "s"} of unknown cost` : ""}`;
+
 /** One row per provider and tier that served, most served first, with failed requests in one last row. */
-function renderAudit({ samples, unsent, usd }: Audit): string[] {
+function renderAudit(audit: Audit): string[] {
+  const { samples, unsent } = audit;
   const lines = [
     `  audit: ${samples.length} unpinned requests, OpenRouter default routing; ` +
       "-p/-e/-x/--zdr not applied, account settings apply",
@@ -515,7 +520,7 @@ function renderAudit({ samples, unsent, usd }: Audit): string[] {
   if (rows.length) {
     lines.push(...table(["provider", "served", "share", "invalid", "quant", "tier"], rows, new Set([1, 2, 3])));
   }
-  lines.push(`  audit: ${fmtUsd(usd)} spent, ${unsent} unsent`);
+  lines.push(`  audit: ${spent(audit)}, ${unsent} unsent`);
   return lines;
 }
 
@@ -583,6 +588,7 @@ function reportJson(report: Report, ctx: Context) {
     audit: report.audit?.samples ?? null,
     auditUnsent: report.audit?.unsent ?? null,
     auditUsd: report.audit ? Number(report.audit.usd.toFixed(8)) : null,
+    auditUncosted: report.audit?.uncosted ?? null,
   };
 }
 
@@ -718,7 +724,7 @@ export async function main(argv: string[]): Promise<number> {
     );
     // A script reading only stdout still sees what the audit spent.
     for (const { slug, audit } of reports) {
-      if (audit) console.error(`${NAME}: --audit-fallback: ${fmtUsd(audit.usd)} spent on ${slug}`);
+      if (audit) console.error(`${NAME}: --audit-fallback: ${spent(audit, ` on ${slug}`)}`);
     }
   } else {
     console.log(`# OpenRouter endpoint ranking · ${new Date().toISOString()} · auth: ${auth?.source ?? "anonymous"}`);

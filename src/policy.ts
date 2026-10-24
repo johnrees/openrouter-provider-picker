@@ -93,8 +93,11 @@ export type AuditSample = {
   toolCallValid: boolean;
   ms: number;
 };
-/** `unsent` counts the requests left when the time budget ran out; `usd` sums the responses' usage.cost. */
-export type Audit = { samples: AuditSample[]; unsent: number; usd: number };
+/**
+ * `unsent` counts the requests left when the time budget ran out. `usd` sums the responses' usage.cost, and
+ * `uncosted` counts the requests whose cost is unknown: served without one, or lost to a timeout.
+ */
+export type Audit = { samples: AuditSample[]; unsent: number; usd: number; uncosted: number };
 export type Report = {
   slug: string;
   error?: string;

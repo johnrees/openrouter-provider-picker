@@ -780,6 +780,21 @@ describe("end to end against a mocked OpenRouter", () => {
       });
     });
 
+    test("a served response with no cost is counted as unknown, not free", async () => {
+      const uncosted = () => new Response(JSON.stringify({ provider: "Wafer", choices: [TOOL_CALL] }));
+      const replies = routing([served("Together"), uncosted, limited]);
+      const { stdout } = await run(replies, ["m/x", "--audit-fallback", "3"]);
+      expect(stdout).toContain("audit: $0.0010 spent, plus 1 request of unknown cost, 0 unsent");
+      const json = await run(routing([served("Together"), uncosted, limited]), [
+        "m/x",
+        "--audit-fallback",
+        "3",
+        "--json",
+      ]);
+      expect(JSON.parse(json.stdout).models[0]).toMatchObject({ auditUsd: 0.001, auditUncosted: 1 });
+      expect(json.stderr).toContain("$0.0010 spent on m/x, plus 1 request of unknown cost");
+    });
+
     test("a per-request fee counts toward the worst case", async () => {
       // Free tokens but $0.02 a request: 50 requests can cost $1.00.
       const list = [ep("fee", { pricing: { prompt: "0", completion: "0", request: "0.02" } }), ...endpoints];
