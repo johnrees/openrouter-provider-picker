@@ -925,7 +925,11 @@ describe("--probe", () => {
       ],
     };
     expect((await run(["m/x", "--probe", "cf"], (mode) => (mode === "auto" ? invented : good(mode)))).code).toBe(1);
-    for (const choice of [{}, { finish_reason: "length", message: { content: null } }]) {
+    for (const choice of [
+      {},
+      { finish_reason: "length", message: { content: null } },
+      { finish_reason: "error", message: { content: null } },
+    ]) {
       const truncated = { provider: "Cloudflare", choices: [choice] };
       expect((await run(["m/x", "--probe", "cf"], (mode) => (mode === "none" ? truncated : good(mode)))).code).toBe(1);
     }
