@@ -1,4 +1,12 @@
+import response from "./fixtures/endpoints.json";
 import type { Endpoint } from "./policy.ts";
+
+/**
+ * Rows of a hand-written GET /models/{slug}/endpoints response for an anonymous
+ * caller, with invented providers. Its cheapest reliable endpoint is fp4; fp8
+ * rows cost a little more and unknown-quantization rows over 2× and $1 more.
+ */
+export const fixtureRows: unknown[] = response.data.endpoints;
 
 /** An eligible, fully up endpoint: $1/M in, $0.1/M cache read, $4/M out ($2.12 per reference run). */
 export function ep(tag: string, overrides: Partial<Endpoint> = {}): Endpoint {

@@ -67,15 +67,16 @@ build `only: [tag]` from `--pick`.
 2. **Uptime first:** the last day, then the last 30 minutes. 98% or more counts
    as fully up.
 3. **Then speed:** estimated time for a 300-token agent turn (time to first
-   token plus streaming).
+   token plus streaming). When uptime and speed tie, higher quantization wins:
+   fp4 < fp8 < bf16 < unknown, which counts as full precision.
 4. **Price only when it's far higher:** an endpoint costing more than 2× _and_
-   more than $1 above the cheapest fully reliable one, per reference agentic
-   session, drops to the bottom (`price-elim`). Otherwise price only breaks
-   ties.
+   more than $1 above the cheapest fully reliable one of equal or better
+   quantization, per reference agentic session, drops to the bottom
+   (`price-elim`). So a cheap fp4 endpoint never eliminates an fp8 one.
+   Otherwise price only breaks ties.
 
-Quantization is shown but never ranked. ZDR status is shown too, and only
-counts with `--zdr`. The thresholds are constants at the top of
-`src/policy.ts`.
+ZDR status is shown too, and only counts with `--zdr`. The thresholds are
+constants at the top of `src/policy.ts`.
 
 ## Development
 
