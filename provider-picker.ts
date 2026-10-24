@@ -615,12 +615,14 @@ async function attempt(
       return result(false, `no finished completion, finish=${finish}`);
     }
     if (mode === "none") {
-      return Array.isArray(calls) && calls.length
+      return (Array.isArray(calls) && calls.length) || finish === "tool_calls"
         ? result(false, `tool call despite tool_choice none, finish=${finish}`)
         : result(true, `served by ${servedBy}, no tool call, finish=${finish}`);
     }
     if (mode === "auto") {
-      const bad = Array.isArray(calls) && calls.length && (finish === "length" || !calls.every(usableCall));
+      const made = Array.isArray(calls) ? calls : [];
+      const bad =
+        finish === "tool_calls" ? !made.length || !made.every(usableCall) : made.length > 0 && !made.every(usableCall);
       return bad
         ? result(false, `unusable tool call, finish=${finish}`)
         : result(true, `served by ${servedBy}, finish=${finish}`);
