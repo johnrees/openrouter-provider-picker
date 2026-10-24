@@ -1151,3 +1151,66 @@ describe("--probe", () => {
     expect(stdout).toContain("nope: no such endpoint for m/x");
   });
 });
+
+describe("completion", () => {
+  const MODELS = { data: [{ id: "deepseek/deepseek-v4-pro" }, { id: "z-ai/glm-5.3" }, { id: 7 }, { id: "bad slug" }] };
+
+  async function run(argv: string[], fetchImpl: () => Response | Promise<Response>) {
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      fetchImpl()) as unknown as typeof fetch);
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const code = await main(argv);
+      return {
+        code,
+        stdout: log.mock.calls.flat().join("\n"),
+        stderr: error.mock.calls.flat().join("\n"),
+        fetches: fetchMock.mock.calls.length,
+      };
+    } finally {
+      fetchMock.mockRestore();
+      log.mockRestore();
+      error.mockRestore();
+    }
+  }
+  const ok = () => new Response(JSON.stringify(MODELS));
+  const down = () => new Response("down", { status: 503 });
+
+  test("--completions zsh prints a zsh function; any other shell exits 2", async () => {
+    const zsh = await run(["--completions", "zsh"], ok);
+    expect(zsh.code).toBe(0);
+    expect(zsh.stdout.startsWith("#compdef opp")).toBe(true);
+    expect(zsh.fetches).toBe(0);
+    const bash = await run(["--completions", "bash"], ok);
+    expect(bash.code).toBe(2);
+    expect(bash.stdout).toBe("");
+  });
+
+  test("--list-models prints the slugs of the model list and caches them", async () => {
+    const out = await run(["--list-models"], ok);
+    expect(out.stdout).toBe("deepseek/deepseek-v4-pro\nz-ai/glm-5.3");
+    expect(out.stderr).toBe("");
+    const cached = await run(["--list-models"], down);
+    expect(cached.stdout).toBe(out.stdout);
+    expect(cached.fetches).toBe(0);
+  });
+
+  test("a stale cache is refetched, and kept when the fetch fails", async () => {
+    const cache = process.env.XDG_CACHE_HOME!;
+    mkdirSync(join(cache, "opp"), { recursive: true });
+    const stale = Date.now() - 25 * 3_600_000;
+    writeFileSync(join(cache, "opp", "models.json"), JSON.stringify({ at: stale, slugs: ["old/model"] }));
+    const failed = await run(["--list-models"], down);
+    expect(failed.fetches).toBe(1);
+    expect(failed.stdout).toBe("old/model");
+    expect(failed.stderr).toBe("");
+    const refreshed = await run(["--list-models"], ok);
+    expect(refreshed.stdout).toContain("z-ai/glm-5.3");
+  });
+
+  test("with no cache and no network, --list-models prints nothing and no error", async () => {
+    const out = await run(["--list-models"], down);
+    expect(out).toMatchObject({ code: 0, stdout: "", stderr: "" });
+  });
+});

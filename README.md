@@ -20,6 +20,17 @@ ln -s "$PWD/provider-picker.ts" ~/.local/bin/opp
 
 There's no build step, so edits and `git pull` take effect immediately.
 
+For zsh completion of model slugs and flags, add this to `.zshrc` after `compinit`:
+
+```sh
+eval "$(opp --completions zsh)"
+```
+
+Or save the output as `_opp` in a directory on your `fpath`. `opp deeps<Tab>` completes
+to `deepseek/deepseek-` and a second Tab lists the matches, and `opp v4-pro<Tab>` finds `deepseek/deepseek-v4-pro`. The model list
+comes from OpenRouter's public model list and is cached for a day in
+`$XDG_CACHE_HOME/opp/models.json`; a Tab press never waits more than two seconds.
+
 ## Use
 
 ```sh

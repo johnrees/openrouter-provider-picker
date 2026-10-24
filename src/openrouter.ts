@@ -50,11 +50,11 @@ export function isEndpoint(value: unknown): value is Endpoint {
 }
 
 /** GET a public OpenRouter path. The key, when given, is sent only here and never to a redirect target. */
-async function getData(path: string, auth?: Auth): Promise<unknown> {
+async function getData(path: string, auth?: Auth, timeoutMs = FETCH_TIMEOUT_MS): Promise<unknown> {
   const res = await fetch(`${API}${path}`, {
     headers: auth ? { Authorization: `Bearer ${auth.key}` } : {},
     redirect: "error",
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const body = (await res.json().catch(() => null)) as { data?: unknown; error?: { message?: unknown } } | null;
   if (!res.ok) {
@@ -103,4 +103,11 @@ export async function fetchZdr(): Promise<Set<string>> {
     if (typeof ep?.model_id === "string" && typeof ep.tag === "string") keys.add(zdrKey(ep.model_id, ep.tag));
   }
   return keys;
+}
+
+/** Every model's id, from the public model list, which needs no key. */
+export async function fetchModelIds(timeoutMs: number): Promise<string[]> {
+  const raw = await getData("/models", undefined, timeoutMs);
+  if (!Array.isArray(raw)) throw new Error("unexpected response: no data array");
+  return (raw as { id?: unknown }[]).flatMap((model) => (typeof model?.id === "string" ? [model.id] : []));
 }
