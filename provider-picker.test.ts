@@ -47,6 +47,7 @@ describe("parseOptions", () => {
     expect(parseOptions(["z-ai/glm-5.3"])).toEqual({
       slugs: ["z-ai/glm-5.3"],
       provider: undefined,
+      excludeProviders: [],
       excludeCountries: [],
       zdr: false,
       verify: false,
@@ -71,7 +72,17 @@ describe("parseOptions", () => {
     expect(parseOptions(["m/x", "-x", "cn,ru", "--exclude-country", "CN"]).excludeCountries).toEqual(["CN", "RU"]);
   });
 
+  test("excluded providers are split, trimmed and deduplicated", () => {
+    expect(parseOptions(["m/x", "-e", "a, b", "--exclude-provider", "b", "-e", "c"]).excludeProviders).toEqual([
+      "a",
+      "b",
+      "c",
+    ]);
+  });
+
   test.each([
+    [["m/x", "-e", ""], /excluded provider must not be empty/],
+    [["m/x", "-e", "a,,b"], /excluded provider must not be empty/],
     [["--provider", "a", "b"], /at most one provider filter/],
     [["--provider", " "], /must not be empty/],
     [["../etc/passwd"], /not a model slug/],
@@ -673,6 +684,30 @@ describe("end to end against a mocked OpenRouter", () => {
     );
     const { stdout } = await run(() => undefined, ["m/x", "-x", "RU"], ZDR_LIST, { providers });
     expect(stdout).toMatch(/together .*datacenter in RU/);
+  });
+
+  test("-e excludes the top endpoint: it is never picked, probed or ranked", async () => {
+    expect((await run(() => undefined, ["m/x", "--pick", "-e", "TOGETHER"])).stdout).toBe("wafer/us");
+    const { stdout } = await run(() => undefined, ["m/x", "-e", "together"]);
+    expect(stdout).toMatch(/together .*excluded: together/);
+    expect(stdout).toContain("not provider ~ together");
+    const { probes } = await run(
+      (tag) => (tag === "wafer/us" ? "Wafer" : undefined),
+      ["m/x", "--verify", "-e", "together"],
+    );
+    expect(probes.map(({ provider }) => provider.only[0])).toEqual(["wafer/us"]);
+    const json = JSON.parse((await run(() => undefined, ["m/x", "--json", "-e", "together"])).stdout);
+    expect(json.excludeProviders).toEqual(["together"]);
+    expect(json.models[0].ranked.map(({ endpoint }: { endpoint: string }) => endpoint)).toEqual(["wafer/us"]);
+    expect(json.models[0].ineligible).toContainEqual(
+      expect.objectContaining({ endpoint: "together", reasons: ["excluded: together"] }),
+    );
+  });
+
+  test("-e wins over -p when an endpoint matches both", async () => {
+    const { code, stdout } = await run(() => undefined, ["m/x", "--pick", "-p", "together", "-e", "together"]);
+    expect(stdout).toBe("");
+    expect(code).toBe(1);
   });
 
   test("-p only filters the view: the price guard still compares against every endpoint", async () => {

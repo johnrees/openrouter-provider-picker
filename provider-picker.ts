@@ -73,6 +73,10 @@ Options:
   -p, --provider <name>       Keep endpoints whose provider name or tag
                               contains <name>, case-insensitively. A bare word
                               without "/" works too: z-ai/glm-5.3 together
+  -e, --exclude-provider <name>
+                              Drop endpoints whose provider name or tag contains
+                              <name>, matched like -p (repeatable or
+                              comma-separated: -e deepinfra,novita). Wins over -p.
   -x, --exclude-country <CC>  Drop endpoints whose provider is headquartered or
                               has a datacenter in this ISO country (repeatable
                               or comma-separated: -x CN,RU). Providers with no
@@ -145,6 +149,7 @@ type Report = {
 export type Options = {
   slugs: string[];
   provider?: string;
+  excludeProviders: string[];
   excludeCountries: string[];
   zdr: boolean;
   verify: boolean;
@@ -162,6 +167,7 @@ export function parseOptions(argv: string[]): Options {
     strict: true,
     options: {
       provider: { type: "string", short: "p", multiple: true },
+      "exclude-provider": { type: "string", short: "e", multiple: true },
       "exclude-country": { type: "string", short: "x", multiple: true },
       zdr: { type: "boolean" },
       verify: { type: "boolean" },
@@ -179,6 +185,10 @@ export function parseOptions(argv: string[]): Options {
   if (!slugs.length && !values.help) throw new Error("give at least one model slug, e.g. z-ai/glm-5.3");
   const badSlug = slugs.find((slug) => !SLUG.test(slug));
   if (badSlug !== undefined) throw new Error(`not a model slug: ${badSlug}`);
+  const excludeProviders = (values["exclude-provider"] ?? [])
+    .flatMap((list) => list.split(","))
+    .map((name) => name.trim());
+  if (excludeProviders.includes("")) throw new Error("excluded provider must not be empty");
   const excludeCountries = (values["exclude-country"] ?? [])
     .flatMap((list) => list.split(","))
     .map((code) => code.trim().toUpperCase());
@@ -187,6 +197,7 @@ export function parseOptions(argv: string[]): Options {
   return {
     slugs,
     provider,
+    excludeProviders: [...new Set(excludeProviders)],
     excludeCountries: [...new Set(excludeCountries)],
     zdr: values.zdr ?? false,
     verify: values.verify ?? false,
@@ -596,11 +607,12 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
   try {
     const { endpoints, malformed } = await fetchEndpoints(slug, auth);
     const excludedBy = (ep: Endpoint) => [
+      ...options.excludeProviders.filter((name) => matchesProvider(ep, name)).map((name) => `excluded: ${name}`),
       ...locationReasons(locationOf(ep, ctx), options.excludeCountries),
       ...(options.zdr && !zdrOf(ep, slug, ctx) ? ["not ZDR"] : []),
     ];
     const kept = (ep: Endpoint) => options.provider === undefined || matchesProvider(ep, options.provider);
-    // Excluded countries and --zdr are hard constraints, so they apply before
+    // Excluded providers, excluded countries and --zdr are hard constraints, so they apply before
     // ranking and can't set the price guard's baseline. The provider filter is
     // only a view: it applies after ranking so the guard still compares against
     // the whole tier.
@@ -932,6 +944,7 @@ export async function main(argv: string[]): Promise<number> {
         {
           generatedAt: new Date().toISOString(),
           authenticated: auth !== undefined,
+          excludeProviders: options.excludeProviders,
           excludeCountries: options.excludeCountries,
           zdrOnly: options.zdr,
           models: reports.map((report) => reportJson(report, ctx)),
@@ -944,6 +957,7 @@ export async function main(argv: string[]): Promise<number> {
     console.log(`# OpenRouter endpoint ranking · ${new Date().toISOString()} · auth: ${auth?.source ?? "anonymous"}`);
     console.log(
       `# eligible: native tools, status 0, tool_choice ${TOOL_CHOICE_MODES.join("/")}` +
+        (options.excludeProviders.length ? `, not provider ~ ${options.excludeProviders.join("/")}` : "") +
         (options.excludeCountries.length ? `, not in ${options.excludeCountries.join("/")}` : "") +
         (options.zdr ? ", ZDR only" : ""),
     );
