@@ -622,6 +622,25 @@ describe("end to end against a mocked OpenRouter", () => {
     });
   });
 
+  test("a pick whose quantization isn't reported says so", async () => {
+    const pickOf = async (list: typeof endpoints) => {
+      const text = await run(() => undefined, ["m/x"], ZDR_LIST, { list });
+      const json = await run(() => undefined, ["m/x", "--json"], ZDR_LIST, { list });
+      return {
+        line: text.stdout.split("\n").find((line) => line.startsWith("  pin: ")),
+        reported: JSON.parse(json.stdout).models[0].pick.quantizationReported,
+      };
+    };
+    expect(await pickOf(endpoints)).toEqual({
+      line: "  pin: m/x:together (quantization not reported)",
+      reported: false,
+    });
+    const bf16 = [ep("together", { provider_name: "Together", quantization: "bf16" })];
+    expect(await pickOf(bf16)).toEqual({ line: "  pin: m/x:together", reported: true });
+    const { stdout } = await run(() => undefined, ["m/x"]);
+    expect(stdout).toContain("quant fp4 < fp8 < ? (not reported) < bf16");
+  });
+
   test("ineligible endpoints show their ZDR status too", async () => {
     const text = await run(() => undefined, ["m/x"]);
     expect(text.stdout).toMatch(/broken +zdr Y +status -2/);

@@ -44,6 +44,7 @@ import {
   pinRouting,
   probeOverrides,
   providerSlug,
+  quantizationReported,
   REFERENCE_RUN,
   type Report,
   rank,
@@ -113,6 +114,9 @@ Output:
       --pick                    Print only each model's chosen endpoint, one line
                                 per model
   -h, --help                    Show this help
+  An endpoint whose listing doesn't report its quantization ranks below bf16
+  and above fp8; a pin on one says "quantization not reported" (--json:
+  pick.quantizationReported false).
 
 Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential.
 Exit status: 0 if every model has a pick, 1 if any has none, 2 on usage errors.`;
@@ -518,7 +522,8 @@ function renderReport(report: Report, ctx: Context): string {
   }
   if (pick) {
     lines.push(
-      `  ${report.verification ? "verified pin" : "pin"}: ${report.slug}:${pick.tag}`,
+      `  ${report.verification ? "verified pin" : "pin"}: ${report.slug}:${pick.tag}` +
+        (quantizationReported(pick) ? "" : " (quantization not reported)"),
       `  routing: "provider": ${JSON.stringify(pinRouting(pick, report.endpoints))}`,
     );
     const note = busyNote(report);
@@ -603,6 +608,7 @@ function reportJson(report: Report, ctx: Context) {
           provider: pick.provider_name,
           routing: pinRouting(pick, report.endpoints),
           verified: report.verification !== undefined,
+          quantizationReported: quantizationReported(pick),
         }
       : null,
     ranked: report.ranked.map(({ endpoint: ep, cost, priceEliminated }, i) => {
@@ -811,7 +817,8 @@ export async function main(argv: string[]): Promise<number> {
     );
     console.log(
       `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties) > turn_s > ttfb > quant > maxout > $run, ` +
-        `price-elim last; turn_s = ttfb + ${TURN_OUTPUT_TOKENS} tokens at tok/s`,
+        `price-elim last; turn_s = ttfb + ${TURN_OUTPUT_TOKENS} tokens at tok/s; ` +
+        `quant fp4 < fp8 < ? (not reported) < bf16`,
     );
     console.log(
       `# price-elim: $run >${PRICE_ELIM_RATIO}x and >$${PRICE_ELIM_DELTA_USD} more than the cheapest ` +

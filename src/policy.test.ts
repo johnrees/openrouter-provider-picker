@@ -10,6 +10,7 @@ import {
   PROBE_TTL_DAYS,
   perMillion,
   pinRouting,
+  quantizationReported,
   quantLevel,
   probeOverrides,
   rank,
@@ -204,20 +205,46 @@ describe("rank", () => {
     expect(ranked.map(({ endpoint }) => endpoint.tag)).toEqual(["a", "unpriced"]);
   });
 
-  test("quantization orders fp4 < fp8 < bf16 < unknown, grouping by bit width", () => {
+  test("quantization orders fp4 < fp8 < unknown < bf16, grouping by bit width", () => {
     const level = (quantization?: string | null) => quantLevel(ep("a", { quantization }));
     expect([level("fp4"), level("nvfp4"), level("int4")]).toEqual([0, 0, 0]);
     expect([level("fp6"), level("fp8"), level("int8")]).toEqual([1, 1, 1]);
-    expect([level("bf16"), level("fp16"), level("FP32")]).toEqual([2, 2, 2]);
-    expect([level("unknown"), level(null), level(undefined), level("constructor")]).toEqual([3, 3, 3, 3]);
+    expect([level("unknown"), level(null), level(undefined), level("constructor")]).toEqual([2, 2, 2, 2]);
+    expect([level("bf16"), level("fp16"), level("FP32")]).toEqual([3, 3, 3]);
+  });
+
+  test("a quantization counts as reported only when QUANT_ORDER places it below or above unknown", () => {
+    const reported = (quantization?: string | null) => quantizationReported(ep("a", { quantization }));
+    expect([reported("fp4"), reported("FP8"), reported("bf16")]).toEqual([true, true, true]);
+    expect([reported("unknown"), reported(null), reported(undefined), reported("constructor")]).toEqual([
+      false,
+      false,
+      false,
+      false,
+    ]);
   });
 
   test("among rows equal on reliability and speed, higher quantization ranks first", () => {
-    // Tags, headroom and price all favour the fp4 row, so only quantization can put fp8 first.
-    const fp4 = ep("a-fp4", { quantization: "fp4", max_completion_tokens: 200_000 });
-    const fp8 = ep("b-fp8", { quantization: "fp8" });
-    expect(tags([fp4, fp8])).toEqual(["b-fp8", "a-fp4"]);
-    expect(tags([fp8, ep("c-unknown")])).toEqual(["c-unknown", "b-fp8"]);
+    // Tag and headroom favour the lower row ("a-"), so only quantization can put the higher one first.
+    const lower = (quantization: string | null) => ep("a-lower", { quantization, max_completion_tokens: 200_000 });
+    const higher = (quantization: string | null) => ep("b-higher", { quantization });
+    for (const [low, high] of [
+      ["fp4", "fp8"],
+      ["fp8", null],
+      [null, "bf16"],
+    ] as const) {
+      expect(tags([lower(low), higher(high)])).toEqual(["b-higher", "a-lower"]);
+    }
+  });
+
+  test("an unknown row's price baseline ignores cheaper fp8 and fp4 rows but not a cheaper bf16 row", () => {
+    const pricey = { prompt: "0.000003", input_cache_read: "0.0000003", completion: "0.000012" };
+    const unknown = ep("pricey-unknown", { pricing: pricey });
+    const eliminated = (cheap: Endpoint) => rank([cheap, unknown]).at(-1)?.priceEliminated;
+    expect(eliminated(ep("cheap-fp4", { quantization: "fp4" }))).toBe(false);
+    expect(eliminated(ep("cheap-fp8", { quantization: "fp8" }))).toBe(false);
+    expect(eliminated(ep("cheap-bf16", { quantization: "bf16" }))).toBe(true);
+    expect(eliminated(ep("cheap-unknown"))).toBe(true);
   });
 
   test("the price guard compares a row only with equal or better quantization", () => {

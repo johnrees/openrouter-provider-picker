@@ -32,12 +32,14 @@ export const PROBE_TTL_DAYS = 7;
 export const COUNTRY = /^[A-Z]{2}$/;
 /**
  * Quantizations from lowest to highest precision; values in one group rank
- * equal. Unknown, missing and unlisted values rank above every group: an
- * undisclosed quantization is treated as full precision.
+ * equal. Missing and unlisted values rank with "unknown": below a reported
+ * full precision, which wins a tie, but above fp8, so a provider that doesn't
+ * report is never price-eliminated by a cheaper fp8 or fp4 row.
  */
 export const QUANT_ORDER: readonly (readonly string[])[] = [
   ["fp4", "nvfp4", "int4"],
   ["fp6", "fp8", "int8"],
+  ["unknown"],
   ["bf16", "fp16", "fp32"],
 ];
 /** --audit-fallback's prompt tokens per request when bounding its cost. A measured request used 137. */
@@ -258,12 +260,20 @@ const reliabilityKey = (ep: Endpoint): number[] => [
   desc(uptimeBucket(ep.uptime_last_30m) ?? uptimeBucket(ep.uptime_last_1d)),
 ];
 
+const UNKNOWN_QUANT_LEVEL = QUANT_ORDER.findIndex((group) => group.includes("unknown"));
+
 /** An endpoint's place in QUANT_ORDER; higher is more precise. */
 export function quantLevel(ep: Endpoint): number {
   const quantization = ep.quantization?.toLowerCase() ?? "";
   const level = QUANT_ORDER.findIndex((group) => group.includes(quantization));
-  return level === -1 ? QUANT_ORDER.length : level;
+  return level === -1 ? UNKNOWN_QUANT_LEVEL : level;
 }
+
+/**
+ * Whether the listing gives a quantization QUANT_ORDER knows. One it doesn't
+ * know ranks as unknown, so it counts as not reported too.
+ */
+export const quantizationReported = (ep: Endpoint): boolean => quantLevel(ep) !== UNKNOWN_QUANT_LEVEL;
 
 function compareKeys(a: readonly number[], b: readonly number[]): number {
   for (let i = 0; i < a.length; i++) {
