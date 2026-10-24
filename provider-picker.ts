@@ -89,6 +89,11 @@ Options:
                               serves (needs a key). A busy endpoint (HTTP 429,
                               5xx) is retried once, then skipped and reported
                               as busy. Stops starting probes after 3 minutes.
+      --probe <tag>           With one model, send four paid requests to the
+                              endpoint with this exact tag, whatever its
+                              eligibility: tool_choice none, auto, required
+                              and a named function. Repeatable. Needs a key.
+                              Exit 1 if any mode fails or a tag is unknown.
       --json                  Print machine-readable results
       --pick                  Print only each model's chosen endpoint tag, one
                               line per model, e.g. wafer/us. A model with no
@@ -153,6 +158,7 @@ export type Options = {
   excludeCountries: string[];
   zdr: boolean;
   verify: boolean;
+  probe: string[];
   json: boolean;
   pick: boolean;
   help: boolean;
@@ -171,6 +177,7 @@ export function parseOptions(argv: string[]): Options {
       "exclude-country": { type: "string", short: "x", multiple: true },
       zdr: { type: "boolean" },
       verify: { type: "boolean" },
+      probe: { type: "string", multiple: true },
       json: { type: "boolean" },
       pick: { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -178,6 +185,13 @@ export function parseOptions(argv: string[]): Options {
   });
   if (values.json && values.pick) throw new Error("--json and --pick are alternative outputs; give one");
   const slugs = positionals.filter((arg) => arg.includes("/"));
+  const probe = (values.probe ?? []).map((tag) => tag.trim());
+  if (probe.some((tag) => tag === "")) throw new Error("--probe needs an endpoint tag");
+  if (probe.length) {
+    if (values.verify || values.pick || values.json)
+      throw new Error("--probe can't be combined with --verify, --pick or --json");
+    if (slugs.length !== 1) throw new Error("--probe takes exactly one model slug");
+  }
   const filters = [...(values.provider ?? []), ...positionals.filter((arg) => !arg.includes("/"))];
   if (filters.length > 1) throw new Error(`give at most one provider filter, got ${filters.join(", ")}`);
   const provider = filters[0]?.trim();
@@ -201,6 +215,7 @@ export function parseOptions(argv: string[]): Options {
     excludeCountries: [...new Set(excludeCountries)],
     zdr: values.zdr ?? false,
     verify: values.verify ?? false,
+    probe,
     json: values.json ?? false,
     pick: values.pick ?? false,
     help: values.help ?? false,
@@ -478,7 +493,7 @@ type ChatResponse = {
   provider?: unknown;
   service_tier?: unknown;
   error?: { message?: unknown; code?: unknown };
-  choices?: { finish_reason?: unknown; message?: { tool_calls?: unknown } }[];
+  choices?: { finish_reason?: unknown; message?: { content?: unknown; tool_calls?: unknown } }[];
 };
 
 const PROBE_TOOL = "ok";
@@ -495,8 +510,32 @@ function isArgumentObject(args: unknown): boolean {
   }
 }
 
+/** A tool call with a name and arguments an agent can parse. */
+const usableCall = (c: unknown): boolean => {
+  const fn = (c as { function?: { name?: unknown; arguments?: unknown } } | null)?.function;
+  return fn?.name === PROBE_TOOL && isArgumentObject(fn.arguments);
+};
+
 /** One probe request's outcome. `retryInMs` is set when the failure is transient. */
 type Attempt = { ok: boolean; detail: string; retryInMs?: number };
+
+/** The tool_choice request value for each mode; the named function is the probe's own tool. */
+export function toolChoiceFor(mode: ToolChoiceMode) {
+  return mode === "function" ? { type: "function", function: { name: PROBE_TOOL } } : mode;
+}
+
+/** The probe request body: one tiny completion pinned to `ep`, with the given tool_choice mode. */
+export function probeBody(slug: string, ep: Endpoint, endpoints: readonly Endpoint[], mode: ToolChoiceMode) {
+  return {
+    model: slug,
+    provider: pinRouting(ep, endpoints),
+    max_tokens: PROBE_MAX_TOKENS,
+    // Eligibility trusts the endpoint's advertised tool support, so the probe exercises it.
+    tools: [{ type: "function", function: { name: PROBE_TOOL, parameters: { type: "object", properties: {} } } }],
+    tool_choice: toolChoiceFor(mode),
+    messages: [{ role: "user", content: `Call the ${PROBE_TOOL} tool.` }],
+  };
+}
 
 /** How long to wait before retrying, from a Retry-After header in seconds, capped. */
 export function retryDelay(header: string | null): number {
@@ -511,16 +550,28 @@ export function retryDelay(header: string | null): number {
  * real request is the only way to learn whether this account can use an
  * endpoint.
  */
-async function probe(slug: string, ep: Endpoint, endpoints: readonly Endpoint[], auth: Auth): Promise<Probe> {
-  const first = await attempt(slug, ep, endpoints, auth);
+async function probe(
+  slug: string,
+  ep: Endpoint,
+  endpoints: readonly Endpoint[],
+  auth: Auth,
+  mode: ToolChoiceMode = "required",
+): Promise<Probe> {
+  const first = await attempt(slug, ep, endpoints, auth, mode);
   if (first.retryInMs === undefined) return { endpoint: ep, ok: first.ok, busy: false, detail: first.detail };
   await Bun.sleep(first.retryInMs);
-  const second = await attempt(slug, ep, endpoints, auth);
+  const second = await attempt(slug, ep, endpoints, auth, mode);
   const busy = second.retryInMs !== undefined;
   return { endpoint: ep, ok: second.ok, busy, detail: `${second.detail}, ${second.ok ? "after a retry" : "retried"}` };
 }
 
-async function attempt(slug: string, ep: Endpoint, endpoints: readonly Endpoint[], auth: Auth): Promise<Attempt> {
+async function attempt(
+  slug: string,
+  ep: Endpoint,
+  endpoints: readonly Endpoint[],
+  auth: Auth,
+  mode: ToolChoiceMode,
+): Promise<Attempt> {
   const result = (ok: boolean, detail: string, retryInMs?: number): Attempt => ({
     ok,
     detail: sanitize(detail, auth.key),
@@ -532,15 +583,7 @@ async function attempt(slug: string, ep: Endpoint, endpoints: readonly Endpoint[
       headers: { Authorization: `Bearer ${auth.key}`, "Content-Type": "application/json" },
       redirect: "error",
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-      body: JSON.stringify({
-        model: slug,
-        provider: pinRouting(ep, endpoints),
-        max_tokens: PROBE_MAX_TOKENS,
-        // Eligibility trusts the endpoint's advertised tool support, so the probe exercises it.
-        tools: [{ type: "function", function: { name: PROBE_TOOL, parameters: { type: "object", properties: {} } } }],
-        tool_choice: "required",
-        messages: [{ role: "user", content: `Call the ${PROBE_TOOL} tool.` }],
-      }),
+      body: JSON.stringify(probeBody(slug, ep, endpoints, mode)),
     });
     const body = (await res.json().catch(() => null)) as ChatResponse | null;
     const upstream = body?.error?.message;
@@ -565,7 +608,33 @@ async function attempt(slug: string, ep: Endpoint, endpoints: readonly Endpoint[
           (c) => c?.function?.name === PROBE_TOOL,
         )
       : undefined;
-    if (!call) return result(false, `no ${PROBE_TOOL} tool call despite tool_choice required, finish=${finish}`);
+    // "none" passes on a plain reply, and any tool call then breaks the contract. "auto" may or may not call,
+    // but a call it makes must be usable. Every mode needs a completion to judge.
+    // A finished reply has a message and did not end on an error or a filter. A reply cut off by max_tokens still passes: length is no tool_choice failure.
+    if (
+      !choice?.message ||
+      !["stop", "tool_calls", "length"].includes(finish) ||
+      // Out of tokens before saying anything is inconclusive, not a pass.
+      (finish === "length" && !(Array.isArray(calls) && calls.length) && !String(choice.message.content ?? "").trim())
+    ) {
+      return result(false, `no finished completion, finish=${finish}`);
+    }
+    if (mode === "none") {
+      return (Array.isArray(calls) && calls.length) || finish === "tool_calls"
+        ? result(false, `tool call despite tool_choice none, finish=${finish}`)
+        : result(true, `served by ${servedBy}, no tool call, finish=${finish}`);
+    }
+    if (mode === "auto") {
+      const made = Array.isArray(calls) ? calls : [];
+      const bad =
+        finish === "tool_calls"
+          ? !made.length || !made.every(usableCall)
+          : made.length > 0 && (finish === "length" || !made.every(usableCall));
+      return bad
+        ? result(false, `unusable tool call, finish=${finish}`)
+        : result(true, `served by ${servedBy}, finish=${finish}`);
+    }
+    if (!call) return result(false, `no ${PROBE_TOOL} tool call despite tool_choice ${mode}, finish=${finish}`);
     // A call cut off by max_tokens, or with arguments an agent can't parse, is no use to an agent loop.
     if (finish === "length" || !isArgumentObject(call.function?.arguments)) {
       return result(false, `unusable ${PROBE_TOOL} tool call, finish=${finish}`);
@@ -592,6 +661,34 @@ async function verify(
     if (outcome.ok) return { probes, verified: endpoint };
   }
   return { probes };
+}
+
+/** Sends all four tool_choice modes to each named endpoint and prints a line per tag and mode. */
+async function probeTags(slug: string, tags: readonly string[], auth: Auth): Promise<boolean> {
+  let ok = true;
+  let endpoints: Endpoint[];
+  try {
+    endpoints = (await fetchEndpoints(slug, auth)).endpoints;
+  } catch (error) {
+    console.error(`${NAME}: ${slug}: fetch failed: ${sanitize(errorMessage(error), auth.key)}`);
+    return false;
+  }
+  for (const tag of tags) {
+    const found = endpoints.find((e) => e.tag.toLowerCase() === tag.toLowerCase());
+    if (!found) {
+      console.log(`${tag}: no such endpoint for ${slug}`);
+      ok = false;
+      continue;
+    }
+    for (const mode of TOOL_CHOICE_MODES) {
+      const outcome = await probe(slug, found, endpoints, auth, mode);
+      ok &&= outcome.ok;
+      const listed = found.supports_tool_choice?.[mode] === true ? "yes" : "no";
+      const status = outcome.ok ? "ok" : outcome.busy ? "busy" : "fail";
+      console.log(`${found.tag}  ${mode}  ${status}  listed: ${listed}  ${outcome.detail}`);
+    }
+  }
+  return ok;
 }
 
 type Context = { options: Options; auth?: Auth; locations?: Map<string, Location>; zdr?: Set<string> };
@@ -874,6 +971,13 @@ export async function main(argv: string[]): Promise<number> {
   if (options.verify && !auth) {
     console.error(`${NAME}: --verify sends real requests and needs an API key; set OPENROUTER_API_KEY`);
     return 2;
+  }
+  if (options.probe.length) {
+    if (!auth) {
+      console.error(`${NAME}: --probe sends real requests and needs an API key; set OPENROUTER_API_KEY`);
+      return 2;
+    }
+    return (await probeTags(options.slugs[0]!, options.probe, auth)) ? 0 : 1;
   }
   if (!auth) {
     console.error(
