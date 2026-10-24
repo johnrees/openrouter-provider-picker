@@ -493,7 +493,7 @@ type ChatResponse = {
   provider?: unknown;
   service_tier?: unknown;
   error?: { message?: unknown; code?: unknown };
-  choices?: { finish_reason?: unknown; message?: { tool_calls?: unknown } }[];
+  choices?: { finish_reason?: unknown; message?: { content?: unknown; tool_calls?: unknown } }[];
 };
 
 const PROBE_TOOL = "ok";
@@ -613,7 +613,12 @@ async function attempt(
     // A finished reply has a message and did not end on an error or a filter. A reply cut off by max_tokens still passes: length is no tool_choice failure.
     if (
       (mode === "none" || mode === "auto") &&
-      (!choice?.message || !["stop", "tool_calls", "length"].includes(finish))
+      (!choice?.message ||
+        !["stop", "tool_calls", "length"].includes(finish) ||
+        // Out of tokens before saying anything is inconclusive, not a pass.
+        (finish === "length" &&
+          !(Array.isArray(calls) && calls.length) &&
+          !String(choice.message.content ?? "").trim()))
     ) {
       return result(false, `no finished completion, finish=${finish}`);
     }

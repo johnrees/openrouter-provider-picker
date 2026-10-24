@@ -932,6 +932,7 @@ describe("--probe", () => {
         message: { content: null, tool_calls: [{ function: { name: "ok", arguments: "{" } }] },
       },
       { finish_reason: "error", message: { content: null } },
+      { finish_reason: "length", message: { content: null } },
       { finish_reason: "tool_calls", message: { content: null, tool_calls: [] } },
     ]) {
       const truncated = { provider: "Cloudflare", choices: [choice] };
