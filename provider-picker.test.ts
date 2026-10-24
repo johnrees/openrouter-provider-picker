@@ -731,6 +731,33 @@ describe("end to end against a mocked OpenRouter", () => {
       }
     });
 
+    test("--verify and the audit share one deadline, so time --verify used is gone", async () => {
+      let now = 0;
+      const clock = spyOn(Date, "now").mockImplementation(() => (now += 100_000)); // 100s per reading
+      try {
+        const { stdout, probes } = await run(mixed(), ["m/x", "--verify", "--audit-fallback", "5", "--json"]);
+        const model = JSON.parse(stdout).models[0];
+        expect(probes.map(({ provider }) => provider?.only[0])).toEqual(["together"]);
+        expect(model.pick.endpoint).toBe("together");
+        expect(model.audit).toEqual([]);
+        expect(model.auditUnsent).toBe(5);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    test("the cap applies to the worst case summed over every model", async () => {
+      // m/x alone: 50 × 512 × $15.625/M = $0.40. n/y adds 50 × (200 × $1/M + 512 × $4/M) = $0.11.
+      const list = [ep("dear", { pricing: { prompt: "0", completion: "0.000015625" } })];
+      const one = await run(mixed(), ["m/x", "--audit-fallback", "50"], ZDR_LIST, { list });
+      expect(one.stderr).toContain("up to $0.40 for 50 requests to m/x");
+      expect(one.code).toBe(0);
+      const both = await run(mixed(), ["m/x", "n/y", "--audit-fallback", "50"], ZDR_LIST, { list });
+      expect(both.code).toBe(2);
+      expect(both.probes).toHaveLength(0);
+      expect(both.stderr).toContain("up to $0.51 for 100 requests to m/x, n/y, over the $0.50 cap");
+    });
+
     test("under --json the spend goes to stderr and stdout stays valid JSON", async () => {
       const { stdout, stderr } = await run(mixed(), ["m/x", "--audit-fallback", "2", "--json"]);
       expect(JSON.parse(stdout).models[0].auditUsd).toBe(0.002);
