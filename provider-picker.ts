@@ -11,56 +11,43 @@
  *
  *   "provider": { "only": ["<endpoint tag>"], "ignore": ["<longer sibling tags>"], "allow_fallbacks": false }
  *
- * README.md explains the policy. Run with --help for usage.
+ * README.md explains the policy. Run with --help for usage. This file is the
+ * Bun command line; src/policy.ts ranks, src/openrouter.ts fetches and
+ * src/probe.ts sends the paid test requests.
  */
 
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { parseArgs } from "node:util";
-
-// ---- Policy -----------------------------------------------------------------
-
-/** Uptime at or above this percentage counts as fully up, so 98.5 and 100 tie. */
-export const UPTIME_SATURATION = 98;
-/**
- * Output tokens in a typical agent turn, used to combine time-to-first-token
- * and throughput into one speed figure. This is REFERENCE_RUN's completion
- * tokens spread over roughly 100 turns.
- */
-export const TURN_OUTPUT_TOKENS = 300;
-/**
- * An endpoint ranks after all others when its reference run costs more than
- * this multiple of the cheapest in the most reliable tier...
- */
-export const PRICE_ELIM_RATIO = 2;
-/** ...and also more than this many dollars extra. Smaller gaps are noise. */
-export const PRICE_ELIM_DELTA_USD = 1;
-/**
- * Token mix of a long agentic session, used to compare prices as one number.
- * Agent loops resend their context, so cache reads dominate: measured sessions
- * read 6M to 29M cached tokens against 0.1M to 2M fresh.
- */
-export const REFERENCE_RUN = { prompt: 500_000, cacheRead: 15_000_000, completion: 30_000 } as const;
-/** An endpoint missing any of these silently degrades agent loops, so it is ineligible. */
-export const TOOL_CHOICE_MODES = ["none", "auto", "required", "function"] as const;
+import { errorMessage, fetchEndpoints, fetchLocations, fetchZdr, sanitize, zdrKey } from "./src/openrouter.ts";
+import {
+  type Auth,
+  COUNTRY,
+  type Endpoint,
+  ineligibleReasons,
+  type Location,
+  locationReasons,
+  matchesProvider,
+  metric,
+  type Options,
+  PRICE_ELIM_DELTA_USD,
+  PRICE_ELIM_RATIO,
+  perMillion,
+  pinRouting,
+  providerSlug,
+  REFERENCE_RUN,
+  type Report,
+  rank,
+  TOOL_CHOICE_MODES,
+  TURN_OUTPUT_TOKENS,
+  turnMs,
+  UPTIME_SATURATION,
+} from "./src/policy.ts";
+import { probe, VERIFY_BUDGET_MS, verify } from "./src/probe.ts";
 
 /** The command name, as installed by package.json "bin". */
 const NAME = "opp";
-const API = "https://openrouter.ai/api/v1";
-const FETCH_TIMEOUT_MS = 30_000;
-/** Generous for a one-tool-call reply; a pin that takes longer is not one to pick. */
-const PROBE_TIMEOUT_MS = 30_000;
-/** Room for a reasoning model to think briefly and still call the tool. Measured calls used 5 to 146 tokens. */
-const PROBE_MAX_TOKENS = 512;
-/** --verify starts no new probe after this long, so a run of hanging endpoints can't stall it for many minutes. */
-const VERIFY_BUDGET_MS = 180_000;
-/** Probe failures that mean "busy, try again shortly" rather than "this route is broken". */
-const TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
-/** Wait before retrying a transient failure, unless Retry-After asks for longer (up to the cap). */
-const PROBE_RETRY_MS = 2_000;
-const PROBE_RETRY_MAX_MS = 10_000;
 const SLUG = /^[a-z0-9][\w.-]*\/[a-z0-9][\w.:-]*$/i;
-const COUNTRY = /^[A-Z]{2}$/;
 
 const USAGE = `Usage: ${NAME} <model/slug ...> [options]
 
@@ -103,67 +90,6 @@ Output:
 
 Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential.
 Exit status: 0 if every model has a pick, 1 if any has none, 2 on usage errors.`;
-
-// ---- Types ------------------------------------------------------------------
-
-type ToolChoiceMode = (typeof TOOL_CHOICE_MODES)[number];
-type Percentiles = { p50?: number | null; p75?: number | null; p90?: number | null; p99?: number | null };
-
-/** The fields this tool reads from an entry of GET /models/{slug}/endpoints. */
-export type Endpoint = {
-  model_id?: string | null;
-  provider_name: string;
-  /** Unique per endpoint, e.g. "baseten/fp4/us". provider_name is not unique. */
-  tag: string;
-  status?: number | null;
-  quantization?: string | null;
-  /** "priority", "flex" or "ultrafast" for a tier endpoint; null for a standard one. */
-  service_tier?: string | null;
-  max_completion_tokens?: number | null;
-  supported_parameters: string[];
-  supports_tool_choice?: Partial<Record<ToolChoiceMode, unknown>> | null;
-  uptime_last_5m?: number | null;
-  uptime_last_30m?: number | null;
-  uptime_last_1d?: number | null;
-  /** Percentiles are null for anonymous callers. */
-  latency_last_30m?: Percentiles | null;
-  throughput_last_30m?: Percentiles | null;
-  perf_last_30m_by_workload?: { text_generation?: { request_count?: number | null } | null } | null;
-  /** USD per token, as decimal strings. */
-  pricing: { prompt?: string | null; completion?: string | null; input_cache_read?: string | null };
-};
-
-/** Where a provider says it operates, from GET /providers. Either field may be unknown. */
-export type Location = { headquarters?: string | null; datacenters?: string[] | null };
-export type Ranked = { endpoint: Endpoint; cost: number | undefined; priceEliminated: boolean };
-export type Auth = { key: string; source: string };
-/** `busy` marks a failure that was still transient after one retry: a rate limit or overload, not a dead route. */
-type Probe = { endpoint: Endpoint; ok: boolean; busy: boolean; detail: string };
-/** `unprobed` counts the candidates left untried when the time budget ran out. */
-type Verification = { probes: Probe[]; verified?: Endpoint; unprobed?: number };
-type Report = {
-  slug: string;
-  error?: string;
-  total: number;
-  malformed: number;
-  /** Every well-formed endpoint of the model, filtered or not: any of them can match a pin. */
-  endpoints: Endpoint[];
-  ranked: Ranked[];
-  ineligible: { endpoint: Endpoint; reasons: string[] }[];
-  verification?: Verification;
-};
-export type Options = {
-  slugs: string[];
-  providers: string[];
-  excludeProviders: string[];
-  excludeCountries: string[];
-  zdr: boolean;
-  verify: boolean;
-  probe: string[];
-  json: boolean;
-  pick: boolean;
-  help: boolean;
-};
 
 // ---- Arguments --------------------------------------------------------------
 
@@ -224,139 +150,7 @@ export function parseOptions(argv: string[]): Options {
   };
 }
 
-// ---- Eligibility and ranking ------------------------------------------------
-
-export function ineligibleReasons(ep: Endpoint): string[] {
-  const reasons: string[] = [];
-  if ((ep.status ?? 0) !== 0) reasons.push(`status ${ep.status}`);
-  if (!ep.supported_parameters.includes("tools")) reasons.push("no native tools");
-  const missing = TOOL_CHOICE_MODES.filter((mode) => ep.supports_tool_choice?.[mode] !== true);
-  if (missing.length) reasons.push(`tool_choice lacks ${missing.join("/")}`);
-  return reasons;
-}
-
-/** The provider part of an endpoint tag, which is its slug in GET /providers. */
-export const providerSlug = (ep: Endpoint): string => ep.tag.split("/")[0]!.toLowerCase();
-
-/** Why a provider's location rules it out. Unknown locations are never excluded. */
-export function locationReasons(location: Location | undefined, excluded: readonly string[]): string[] {
-  const reasons: string[] = [];
-  const hq = location?.headquarters;
-  if (hq && excluded.includes(hq)) reasons.push(`headquartered in ${hq}`);
-  const datacenters = (location?.datacenters ?? []).filter((code) => excluded.includes(code));
-  if (datacenters.length) reasons.push(`datacenter in ${datacenters.join("/")}`);
-  return reasons;
-}
-
-/** A finite, non-negative number, or undefined for anything missing or malformed. */
-const metric = (value: unknown): number | undefined =>
-  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
-
-/** Converts an OpenRouter rate (USD per token, as a string) to USD per million tokens. */
-export function perMillion(rate: string | null | undefined): number | undefined {
-  if (rate == null || rate.trim() === "") return undefined;
-  return metric(Number(rate) * 1_000_000);
-}
-
-/** USD for one REFERENCE_RUN on this endpoint, or undefined when its prices are unknown. */
-export function referenceRunCost(ep: Endpoint): number | undefined {
-  const input = perMillion(ep.pricing.prompt);
-  const output = perMillion(ep.pricing.completion);
-  if (input === undefined || output === undefined) return undefined;
-  // No cache-read price means no cache discount: cached tokens bill as input.
-  const cacheRead = perMillion(ep.pricing.input_cache_read) ?? input;
-  const { prompt, cacheRead: cached, completion } = REFERENCE_RUN;
-  return (prompt * input + cached * cacheRead + completion * output) / 1_000_000;
-}
-
-/** Estimated milliseconds for a typical agent turn: median TTFB plus TURN_OUTPUT_TOKENS at median speed. */
-export function turnMs(ep: Endpoint): number | undefined {
-  const ttfb = metric(ep.latency_last_30m?.p50);
-  const tps = metric(ep.throughput_last_30m?.p50);
-  if (ttfb === undefined || !tps) return undefined;
-  return ttfb + (TURN_OUTPUT_TOKENS / tps) * 1000;
-}
-
-const uptimeBucket = (value: unknown): number | undefined => {
-  const uptime = metric(value);
-  return uptime !== undefined && uptime >= UPTIME_SATURATION ? 100 : uptime;
-};
-
-// Sort keys ascend. Missing values sort last in either direction.
-const asc = (value: number | undefined): number => value ?? Infinity;
-const desc = (value: number | undefined): number => (value === undefined ? Infinity : -value);
-
-/**
- * The 1-day window outranks the 30-minute one: a clean day beats a clean half
- * hour. An endpoint with no traffic in the last 30 minutes has no 30-minute
- * uptime, so its day stands in rather than ranking it below a measured failure.
- */
-const reliabilityKey = (ep: Endpoint): number[] => [
-  desc(uptimeBucket(ep.uptime_last_1d)),
-  desc(uptimeBucket(ep.uptime_last_30m) ?? uptimeBucket(ep.uptime_last_1d)),
-];
-
-function compareKeys(a: readonly number[], b: readonly number[]): number {
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return a[i]! < b[i]! ? -1 : 1;
-  }
-  return 0;
-}
-
-/** Ranks eligible endpoints best first and drops the ineligible ones. */
-export function rank(endpoints: readonly Endpoint[]): Ranked[] {
-  const eligible = endpoints.filter((ep) => ineligibleReasons(ep).length === 0);
-  if (!eligible.length) return [];
-
-  // Price guard baseline: the cheapest endpoint in the most reliable tier, the
-  // cost of a choice that gives up nothing on uptime. Anything far pricier
-  // ranks after every endpoint that isn't, keeping its order among its peers.
-  const best = eligible.map(reliabilityKey).reduce((a, b) => (compareKeys(a, b) <= 0 ? a : b));
-  const topTierCosts = eligible
-    .filter((ep) => compareKeys(reliabilityKey(ep), best) === 0)
-    .map(referenceRunCost)
-    .filter((cost) => cost !== undefined);
-  const cheapest = Math.min(...topTierCosts);
-
-  const key = ({ endpoint: ep, cost, priceEliminated }: Ranked): number[] => [
-    priceEliminated ? 1 : 0,
-    ...reliabilityKey(ep),
-    asc(turnMs(ep)),
-    asc(metric(ep.latency_last_30m?.p50)), // when throughput is unknown
-    desc(metric(ep.max_completion_tokens)), // output headroom
-    asc(cost), // price only breaks ties
-  ];
-  return eligible
-    .map((endpoint): Ranked => {
-      const cost = referenceRunCost(endpoint);
-      const priceEliminated =
-        cost !== undefined &&
-        Number.isFinite(cheapest) &&
-        cost > cheapest * PRICE_ELIM_RATIO &&
-        cost - cheapest > PRICE_ELIM_DELTA_USD;
-      return { endpoint, cost, priceEliminated };
-    })
-    .sort((a, b) => compareKeys(key(a), key(b)) || a.endpoint.tag.localeCompare(b.endpoint.tag));
-}
-
-export function matchesProvider(ep: Endpoint, filter: string): boolean {
-  const needle = filter.toLowerCase();
-  return ep.provider_name.toLowerCase().includes(needle) || ep.tag.toLowerCase().includes(needle);
-}
-
-/**
- * The `provider` object for a chat request that pins this one endpoint. A
- * `model:provider` suffix does not do this: OpenRouter ignores it and routes
- * as usual. `only` matches by prefix, so a pin on "fireworks" also matches
- * "fireworks/fast"; `ignore` lists every such longer tag among `endpoints`
- * and is left out when there is none.
- */
-export function pinRouting(ep: Endpoint, endpoints: readonly Endpoint[]) {
-  const ignore = endpoints.map(({ tag }) => tag).filter((tag) => tag.startsWith(`${ep.tag}/`));
-  return { only: [ep.tag], ...(ignore.length ? { ignore: ignore.sort() } : {}), allow_fallbacks: false };
-}
-
-// ---- Auth and output hygiene ------------------------------------------------
+// ---- Auth -------------------------------------------------------------------
 
 /**
  * Finds an OpenRouter key: OPENROUTER_API_KEY, else opencode's credential
@@ -389,281 +183,7 @@ export function resolveAuth(env: Record<string, string | undefined> = process.en
   }
 }
 
-/**
- * Makes upstream text safe to print. It scrubs the key and anything shaped
- * like an OpenRouter key, removes terminal control characters and newlines,
- * and truncates. Scrubbing runs before truncation so a cut can't hide a key.
- */
-export function sanitize(text: string, secret?: string, max = 200): string {
-  let out = secret ? text.split(secret).join("[redacted]") : text;
-  out = out
-    .replace(/sk-or-[\w-]+/g, "[redacted]")
-    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return out.length > max ? `${out.slice(0, max - 1)}…` : out;
-}
-
-const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
-
-// ---- OpenRouter -------------------------------------------------------------
-
-const PRINTABLE = /^[^\u0000-\u001f\u007f-\u009f]+$/;
-const isRate = (rate: unknown): boolean => rate == null || typeof rate === "string";
-/** Optional text that reaches the terminal unescaped, so it must be printable too. */
-const isLabel = (label: unknown): boolean => label == null || (typeof label === "string" && PRINTABLE.test(label));
-
-export function isEndpoint(value: unknown): value is Endpoint {
-  if (typeof value !== "object" || value === null) return false;
-  const ep = value as Record<string, unknown>;
-  const pricing = ep.pricing as Record<string, unknown> | null | undefined;
-  return (
-    typeof ep.provider_name === "string" &&
-    PRINTABLE.test(ep.provider_name) &&
-    typeof ep.tag === "string" &&
-    PRINTABLE.test(ep.tag) &&
-    isLabel(ep.quantization) &&
-    isLabel(ep.service_tier) &&
-    (ep.status == null || Number.isInteger(ep.status)) &&
-    Array.isArray(ep.supported_parameters) &&
-    ep.supported_parameters.every((p) => typeof p === "string") &&
-    typeof pricing === "object" &&
-    pricing !== null &&
-    isRate(pricing.prompt) &&
-    isRate(pricing.completion) &&
-    isRate(pricing.input_cache_read)
-  );
-}
-
-/** GET a public OpenRouter path. The key, when given, is sent only here and never to a redirect target. */
-async function getData(path: string, auth?: Auth): Promise<unknown> {
-  const res = await fetch(`${API}${path}`, {
-    headers: auth ? { Authorization: `Bearer ${auth.key}` } : {},
-    redirect: "error",
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
-  const body = (await res.json().catch(() => null)) as { data?: unknown; error?: { message?: unknown } } | null;
-  if (!res.ok) {
-    const message = body?.error?.message;
-    throw new Error(`HTTP ${res.status}${message == null ? "" : `: ${String(message)}`}`);
-  }
-  return body?.data;
-}
-
-async function fetchEndpoints(slug: string, auth?: Auth): Promise<{ endpoints: Endpoint[]; malformed: number }> {
-  const path = slug.split("/").map(encodeURIComponent).join("/");
-  const raw = ((await getData(`/models/${path}/endpoints`, auth)) as { endpoints?: unknown } | undefined)?.endpoints;
-  if (!Array.isArray(raw)) throw new Error("unexpected response: no data.endpoints array");
-  const endpoints = raw.filter(isEndpoint);
-  return { endpoints, malformed: raw.length - endpoints.length };
-}
-
-/** Provider locations by slug. Public data, so no key is sent. */
-async function fetchLocations(): Promise<Map<string, Location>> {
-  const raw = await getData("/providers");
-  if (!Array.isArray(raw)) throw new Error("unexpected response: no data array");
-  const code = (value: unknown): string | undefined =>
-    typeof value === "string" && COUNTRY.test(value.toUpperCase()) ? value.toUpperCase() : undefined;
-  const locations = new Map<string, Location>();
-  for (const provider of raw as { slug?: unknown; headquarters?: unknown; datacenters?: unknown }[]) {
-    if (typeof provider?.slug !== "string") continue;
-    locations.set(provider.slug.toLowerCase(), {
-      headquarters: code(provider.headquarters) ?? null,
-      datacenters: Array.isArray(provider.datacenters)
-        ? provider.datacenters.map(code).filter((c) => c !== undefined)
-        : null,
-    });
-  }
-  return locations;
-}
-
-/** Keys an endpoint by model and tag, the identity OpenRouter's ZDR list uses. */
-const zdrKey = (model: string, tag: string): string => `${model}\u0000${tag}`;
-
-/** Every zero-data-retention endpoint, as zdrKey values. Public data, so no key is sent. */
-async function fetchZdr(): Promise<Set<string>> {
-  const raw = await getData("/endpoints/zdr");
-  if (!Array.isArray(raw)) throw new Error("unexpected response: no data array");
-  const keys = new Set<string>();
-  for (const ep of raw as { model_id?: unknown; tag?: unknown }[]) {
-    if (typeof ep?.model_id === "string" && typeof ep.tag === "string") keys.add(zdrKey(ep.model_id, ep.tag));
-  }
-  return keys;
-}
-
-type ChatResponse = {
-  provider?: unknown;
-  service_tier?: unknown;
-  error?: { message?: unknown; code?: unknown };
-  choices?: { finish_reason?: unknown; message?: { content?: unknown; tool_calls?: unknown } }[];
-};
-
-const PROBE_TOOL = "ok";
-
-/** Tool-call arguments as a JSON object string; empty means no arguments. */
-function isArgumentObject(args: unknown): boolean {
-  if (args === "") return true;
-  if (typeof args !== "string") return false;
-  try {
-    const parsed: unknown = JSON.parse(args);
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
-  } catch {
-    return false;
-  }
-}
-
-/** A tool call with a name and arguments an agent can parse. */
-const usableCall = (c: unknown): boolean => {
-  const fn = (c as { function?: { name?: unknown; arguments?: unknown } } | null)?.function;
-  return fn?.name === PROBE_TOOL && isArgumentObject(fn.arguments);
-};
-
-/** One probe request's outcome. `retryInMs` is set when the failure is transient. */
-type Attempt = { ok: boolean; detail: string; retryInMs?: number };
-
-/** The tool_choice request value for each mode; the named function is the probe's own tool. */
-export function toolChoiceFor(mode: ToolChoiceMode) {
-  return mode === "function" ? { type: "function", function: { name: PROBE_TOOL } } : mode;
-}
-
-/** The probe request body: one tiny completion pinned to `ep`, with the given tool_choice mode. */
-export function probeBody(slug: string, ep: Endpoint, endpoints: readonly Endpoint[], mode: ToolChoiceMode) {
-  return {
-    model: slug,
-    provider: pinRouting(ep, endpoints),
-    max_tokens: PROBE_MAX_TOKENS,
-    // Eligibility trusts the endpoint's advertised tool support, so the probe exercises it.
-    tools: [{ type: "function", function: { name: PROBE_TOOL, parameters: { type: "object", properties: {} } } }],
-    tool_choice: toolChoiceFor(mode),
-    messages: [{ role: "user", content: `Call the ${PROBE_TOOL} tool.` }],
-  };
-}
-
-/** How long to wait before retrying, from a Retry-After header in seconds, capped. */
-export function retryDelay(header: string | null): number {
-  const seconds = header === null || header.trim() === "" ? NaN : Number(header);
-  return Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds * 1000, PROBE_RETRY_MAX_MS) : PROBE_RETRY_MS;
-}
-
-/**
- * Sends one minimal completion pinned to `ep`, retrying once if the endpoint
- * is busy. Account data controls, such as zero-retention or data-collection
- * exclusions, are enforced only at routing time and appear in no API field. A
- * real request is the only way to learn whether this account can use an
- * endpoint.
- */
-async function probe(
-  slug: string,
-  ep: Endpoint,
-  endpoints: readonly Endpoint[],
-  auth: Auth,
-  mode: ToolChoiceMode = "required",
-): Promise<Probe> {
-  const first = await attempt(slug, ep, endpoints, auth, mode);
-  if (first.retryInMs === undefined) return { endpoint: ep, ok: first.ok, busy: false, detail: first.detail };
-  await Bun.sleep(first.retryInMs);
-  const second = await attempt(slug, ep, endpoints, auth, mode);
-  const busy = second.retryInMs !== undefined;
-  return { endpoint: ep, ok: second.ok, busy, detail: `${second.detail}, ${second.ok ? "after a retry" : "retried"}` };
-}
-
-async function attempt(
-  slug: string,
-  ep: Endpoint,
-  endpoints: readonly Endpoint[],
-  auth: Auth,
-  mode: ToolChoiceMode,
-): Promise<Attempt> {
-  const result = (ok: boolean, detail: string, retryInMs?: number): Attempt => ({
-    ok,
-    detail: sanitize(detail, auth.key),
-    ...(retryInMs !== undefined && { retryInMs }),
-  });
-  try {
-    const res = await fetch(`${API}/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${auth.key}`, "Content-Type": "application/json" },
-      redirect: "error",
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-      body: JSON.stringify(probeBody(slug, ep, endpoints, mode)),
-    });
-    const body = (await res.json().catch(() => null)) as ChatResponse | null;
-    const upstream = body?.error?.message;
-    if (!res.ok || upstream != null) {
-      // OpenRouter can also report an upstream rate limit as an error body on a 200.
-      const status = res.ok ? Number(body?.error?.code) : res.status;
-      const retryInMs = TRANSIENT_STATUSES.has(status) ? retryDelay(res.headers.get("retry-after")) : undefined;
-      return result(false, `HTTP ${status || res.status}${upstream == null ? "" : ` ${String(upstream)}`}`, retryInMs);
-    }
-    // Pinning makes this unreachable unless OpenRouter changes semantics. Check anyway, since verifying is the point.
-    const servedBy = typeof body?.provider === "string" ? body.provider : "an unknown provider";
-    if (servedBy.toLowerCase() !== ep.provider_name.toLowerCase()) return result(false, `served by ${servedBy}`);
-    // A provider's tier endpoints share its name, so check the tier too. Responses call the standard tier "default".
-    const tier = body?.service_tier;
-    const want = ep.service_tier ?? "default";
-    if (typeof tier === "string" && tier !== want) return result(false, `served at tier ${tier}, expected ${want}`);
-    const choice = body?.choices?.[0];
-    const finish = String(choice?.finish_reason ?? "none");
-    const calls = choice?.message?.tool_calls;
-    const call = Array.isArray(calls)
-      ? (calls as ({ function?: { name?: unknown; arguments?: unknown } } | null)[]).find(
-          (c) => c?.function?.name === PROBE_TOOL,
-        )
-      : undefined;
-    // "none" passes on a plain reply, and any tool call then breaks the contract. "auto" may or may not call,
-    // but a call it makes must be usable. Every mode needs a completion to judge.
-    // A finished reply has a message and did not end on an error or a filter. A reply cut off by max_tokens still passes: length is no tool_choice failure.
-    if (
-      !choice?.message ||
-      !["stop", "tool_calls", "length"].includes(finish) ||
-      // Out of tokens before saying anything is inconclusive, not a pass.
-      (finish === "length" && !(Array.isArray(calls) && calls.length) && !String(choice.message.content ?? "").trim())
-    ) {
-      return result(false, `no finished completion, finish=${finish}`);
-    }
-    if (mode === "none") {
-      return (Array.isArray(calls) && calls.length) || finish === "tool_calls"
-        ? result(false, `tool call despite tool_choice none, finish=${finish}`)
-        : result(true, `served by ${servedBy}, no tool call, finish=${finish}`);
-    }
-    if (mode === "auto") {
-      const made = Array.isArray(calls) ? calls : [];
-      const bad =
-        finish === "tool_calls"
-          ? !made.length || !made.every(usableCall)
-          : made.length > 0 && (finish === "length" || !made.every(usableCall));
-      return bad
-        ? result(false, `unusable tool call, finish=${finish}`)
-        : result(true, `served by ${servedBy}, finish=${finish}`);
-    }
-    if (!call) return result(false, `no ${PROBE_TOOL} tool call despite tool_choice ${mode}, finish=${finish}`);
-    // A call cut off by max_tokens, or with arguments an agent can't parse, is no use to an agent loop.
-    if (finish === "length" || !isArgumentObject(call.function?.arguments)) {
-      return result(false, `unusable ${PROBE_TOOL} tool call, finish=${finish}`);
-    }
-    return result(true, `served by ${servedBy}, finish=${finish}`);
-  } catch (error) {
-    return result(false, errorMessage(error));
-  }
-}
-
-/** Probes candidates in rank order and stops at the first that serves. */
-async function verify(
-  slug: string,
-  candidates: readonly Ranked[],
-  endpoints: readonly Endpoint[],
-  auth: Auth,
-): Promise<Verification> {
-  const deadline = Date.now() + VERIFY_BUDGET_MS;
-  const probes: Probe[] = [];
-  for (const { endpoint } of candidates) {
-    if (Date.now() >= deadline) return { probes, unprobed: candidates.length - probes.length };
-    const outcome = await probe(slug, endpoint, endpoints, auth);
-    probes.push(outcome);
-    if (outcome.ok) return { probes, verified: endpoint };
-  }
-  return { probes };
-}
+// ---- Reports ----------------------------------------------------------------
 
 /** Sends all four tool_choice modes to each named endpoint and prints a line per tag and mode. */
 async function probeTags(slug: string, tags: readonly string[], auth: Auth): Promise<boolean> {
@@ -752,7 +272,6 @@ function noPickReason(report: Report): string {
   return "no eligible endpoint";
 }
 
-/** Tags that were only busy when probed. A re-run may pick one of them instead. */
 /** Names the endpoints that were only busy when probed, since a re-run may pick one; "" when there are none. */
 function busyNote(report: Report): string {
   const busy = report.verification?.probes.filter(({ busy }) => busy).map(({ endpoint }) => endpoint.tag) ?? [];

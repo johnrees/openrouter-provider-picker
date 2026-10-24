@@ -8,7 +8,8 @@
     "opp": "./provider-picker.ts"
   },
   "files": [
-    "provider-picker.ts"
+    "provider-picker.ts",
+    "src/"
   ],
   "scripts": {
     "pick": "bun provider-picker.ts"
