@@ -114,6 +114,9 @@ Output:
       --pick                    Print only each model's chosen endpoint, one line
                                 per model
   -h, --help                    Show this help
+  An endpoint whose listing doesn't report its quantization ranks below bf16
+  and above fp8; a pin on one says "quantization not reported" (--json:
+  pick.quantizationReported false).
 
 Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential.
 Exit status: 0 if every model has a pick, 1 if any has none, 2 on usage errors.`;
