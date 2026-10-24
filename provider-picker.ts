@@ -294,14 +294,31 @@ async function sendProbes(report: Report, { options, auth }: Context): Promise<R
   return { ...report, ...(verification && { verification }), ...(audit && { audit }) };
 }
 
-/** The most `n` unpinned requests can cost: default routing may choose any endpoint, so take the highest prices. */
-function auditWorstCase(endpoints: readonly Endpoint[], n: number): number {
-  // main refuses to audit a model with an unpriced endpoint, so every rate here is known.
-  const highest = (rates: (string | null | undefined)[]) => Math.max(0, ...rates.map((rate) => perMillion(rate) ?? 0));
-  const perRequest =
-    AUDIT_PROMPT_TOKENS * highest(endpoints.map((ep) => ep.pricing.prompt)) +
-    PROBE_MAX_TOKENS * highest(endpoints.map((ep) => ep.pricing.completion));
-  return (n * perRequest) / 1_000_000;
+/** An optional charge in USD (per unit of `scale`): 0 when unlisted, undefined when listed but unreadable. */
+const optionalRate = (rate: unknown, scale = 1): number | undefined =>
+  rate == null || rate === "" ? 0 : typeof rate === "string" ? metric(Number(rate) * scale) : undefined;
+
+/**
+ * The most `n` unpinned requests can cost in USD: default routing may choose any endpoint, so take the highest
+ * prices, including a flat per-request fee. undefined when an endpoint's prices can't bound it.
+ */
+function auditWorstCase(endpoints: readonly Endpoint[], n: number): number | undefined {
+  let input = 0;
+  let output = 0;
+  let fee = 0;
+  for (const { pricing } of endpoints) {
+    const prompt = perMillion(pricing.prompt);
+    const completion = perMillion(pricing.completion);
+    const reasoning = optionalRate(pricing.internal_reasoning, 1_000_000);
+    const request = optionalRate(pricing.request);
+    if (prompt === undefined || completion === undefined || reasoning === undefined || request === undefined) {
+      return undefined;
+    }
+    input = Math.max(input, prompt);
+    output = Math.max(output, completion, reasoning);
+    fee = Math.max(fee, request);
+  }
+  return n * ((AUDIT_PROMPT_TOKENS * input + PROBE_MAX_TOKENS * output) / 1_000_000 + fee);
 }
 
 const pickOf = (report: Report): Endpoint | undefined =>
@@ -642,20 +659,15 @@ export async function main(argv: string[]): Promise<number> {
   if (n !== undefined) {
     // The audit's cost is bounded over every model before any paid request, --verify's included, is sent.
     const audited = (await Promise.all(fetched)).filter((report) => !report.error);
-    // Default routing may choose an endpoint with no listed price, or one opp skipped as malformed, so neither can be bounded.
-    const unpriced = audited.filter(
-      ({ endpoints, malformed }) =>
-        malformed > 0 ||
-        endpoints.some(
-          ({ pricing }) => perMillion(pricing.prompt) === undefined || perMillion(pricing.completion) === undefined,
-        ),
-    );
+    // Default routing may choose an endpoint with no usable price, or one opp skipped as malformed, so neither can be bounded.
+    const bounds = audited.map(({ endpoints, malformed }) => (malformed ? undefined : auditWorstCase(endpoints, n)));
+    const unpriced = audited.filter((_, i) => bounds[i] === undefined);
     if (unpriced.length) {
       const slugs = unpriced.map(({ slug }) => slug).join(", ");
       console.error(`${NAME}: --audit-fallback: can't bound the cost of ${slugs}: an endpoint has no usable price`);
       return 2;
     }
-    const usd = audited.reduce((sum, report) => sum + auditWorstCase(report.endpoints, n), 0);
+    const usd = bounds.reduce((sum: number, bound) => sum + bound!, 0);
     const estimate = `up to ${fmtUsd(usd)} for ${n * audited.length} requests to ${audited.map(({ slug }) => slug).join(", ")}`;
     if (usd > AUDIT_MAX_USD) {
       console.error(`${NAME}: --audit-fallback: ${estimate}, over the ${fmtUsd(AUDIT_MAX_USD)} cap; ask for fewer`);

@@ -67,7 +67,14 @@ export type Endpoint = {
   throughput_last_30m?: Percentiles | null;
   perf_last_30m_by_workload?: { text_generation?: { request_count?: number | null } | null } | null;
   /** USD per token, as decimal strings. */
-  pricing: { prompt?: string | null; completion?: string | null; input_cache_read?: string | null };
+  pricing: {
+    prompt?: string | null;
+    completion?: string | null;
+    input_cache_read?: string | null;
+    internal_reasoning?: string | null;
+    /** A flat fee per request, in USD. */
+    request?: string | null;
+  };
 };
 
 /** Where a provider says it operates, from GET /providers. Either field may be unknown. */

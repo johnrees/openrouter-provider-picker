@@ -747,6 +747,7 @@ describe("end to end against a mocked OpenRouter", () => {
     test.each([
       ["no price", { pricing: { prompt: null, completion: "0.000004" } }],
       ["a price that isn't a number", { pricing: { prompt: "0.000001", completion: "free" } }],
+      ["a request fee that isn't a number", { pricing: { prompt: "0", completion: "0", request: "n/a" } }],
     ])("an endpoint with %s can't be bounded, so it exits 2 before any request", async (_, overrides) => {
       const list = [ep("unpriced", overrides), ...endpoints];
       const { code, probes, stderr } = await run(mixed(), ["m/x", "--verify", "--audit-fallback", "1"], ZDR_LIST, {
@@ -777,6 +778,15 @@ describe("end to end against a mocked OpenRouter", () => {
         provider: "Evil [2J[redacted]",
         serviceTier: "flex",
       });
+    });
+
+    test("a per-request fee counts toward the worst case", async () => {
+      // Free tokens but $0.02 a request: 50 requests can cost $1.00.
+      const list = [ep("fee", { pricing: { prompt: "0", completion: "0", request: "0.02" } }), ...endpoints];
+      const { code, probes, stderr } = await run(mixed(), ["m/x", "--audit-fallback", "50"], ZDR_LIST, { list });
+      expect(code).toBe(2);
+      expect(probes).toHaveLength(0);
+      expect(stderr).toContain("up to $1.11 for 50 requests to m/x, over the $0.50 cap");
     });
 
     test("a worst case over the cap exits 2 before any request, --verify's included", async () => {
