@@ -1,6 +1,25 @@
 import { describe, expect, test } from "bun:test";
-import { ep } from "./fixtures.ts";
-import { isEndpoint, sanitize } from "./openrouter.ts";
+import { ep, fixtureRows } from "./fixtures.ts";
+import { fetchEndpoints, isEndpoint, sanitize } from "./openrouter.ts";
+
+describe("endpoint shape", () => {
+  test("every row of the fixture response is a well-formed endpoint", () => {
+    expect(fixtureRows.length).toBeGreaterThan(0);
+    for (const row of fixtureRows) expect(isEndpoint(row)).toBe(true);
+  });
+
+  // Opt-in: the only test that touches the network. It catches schema drift
+  // in OpenRouter's response without committing a copy of it.
+  test.skipIf(process.env.OPP_LIVE !== "1")(
+    "every live row is a well-formed endpoint (OPP_LIVE=1)",
+    async () => {
+      const { endpoints, malformed } = await fetchEndpoints("z-ai/glm-5.3");
+      expect(endpoints.length).toBeGreaterThan(0);
+      expect(malformed).toBe(0);
+    },
+    30_000,
+  );
+});
 
 describe("secrets", () => {
   test("sanitize scrubs the key, key-shaped strings and control characters", () => {

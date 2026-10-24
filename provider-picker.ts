@@ -589,12 +589,12 @@ export async function main(argv: string[]): Promise<number> {
         (options.zdr ? ", ZDR only" : ""),
     );
     console.log(
-      `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties) > turn_s > ttfb > maxout > $run, ` +
+      `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties) > turn_s > ttfb > quant > maxout > $run, ` +
         `price-elim last; turn_s = ttfb + ${TURN_OUTPUT_TOKENS} tokens at tok/s`,
     );
     console.log(
       `# price-elim: $run >${PRICE_ELIM_RATIO}x and >$${PRICE_ELIM_DELTA_USD} more than the cheapest ` +
-        `top-uptime endpoint; ranks after all others`,
+        `top-uptime endpoint of equal or better quant; ranks after all others`,
     );
     console.log(
       `# prices: USD per million tokens; $run = ${REFERENCE_RUN.prompt / 1000}k in + ` +

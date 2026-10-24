@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { ep } from "./fixtures.ts";
+import { ep, fixtureRows } from "./fixtures.ts";
+import { isEndpoint } from "./openrouter.ts";
 import {
   type Endpoint,
   ineligibleReasons,
@@ -7,6 +8,7 @@ import {
   matchesProvider,
   perMillion,
   pinRouting,
+  quantLevel,
   rank,
   referenceRunCost,
   turnMs,
@@ -148,6 +150,74 @@ describe("rank", () => {
     const ranked = rank([unpriced, ep("a")]);
     expect(ranked.find(({ endpoint }) => endpoint === unpriced)?.priceEliminated).toBe(false);
     expect(ranked.map(({ endpoint }) => endpoint.tag)).toEqual(["a", "unpriced"]);
+  });
+
+  test("quantization orders fp4 < fp8 < bf16 < unknown, grouping by bit width", () => {
+    const level = (quantization?: string | null) => quantLevel(ep("a", { quantization }));
+    expect([level("fp4"), level("nvfp4"), level("int4")]).toEqual([0, 0, 0]);
+    expect([level("fp6"), level("fp8"), level("int8")]).toEqual([1, 1, 1]);
+    expect([level("bf16"), level("fp16"), level("FP32")]).toEqual([2, 2, 2]);
+    expect([level("unknown"), level(null), level(undefined), level("constructor")]).toEqual([3, 3, 3, 3]);
+  });
+
+  test("among rows equal on reliability and speed, higher quantization ranks first", () => {
+    // Tags, headroom and price all favour the fp4 row, so only quantization can put fp8 first.
+    const fp4 = ep("a-fp4", { quantization: "fp4", max_completion_tokens: 200_000 });
+    const fp8 = ep("b-fp8", { quantization: "fp8" });
+    expect(tags([fp4, fp8])).toEqual(["b-fp8", "a-fp4"]);
+    expect(tags([fp8, ep("c-unknown")])).toEqual(["c-unknown", "b-fp8"]);
+  });
+
+  test("the price guard compares a row only with equal or better quantization", () => {
+    const pricey = { prompt: "0.000003", input_cache_read: "0.0000003", completion: "0.000012" };
+    const cheapFp4 = ep("cheap-fp4", { quantization: "fp4" });
+    const ranked = rank([
+      cheapFp4,
+      ep("pricey-fp4", { quantization: "fp4", pricing: pricey }),
+      ep("pricey-fp8", { quantization: "fp8", pricing: pricey }),
+    ]);
+    const eliminated = Object.fromEntries(
+      ranked.map(({ endpoint, priceEliminated }) => [endpoint.tag, priceEliminated]),
+    );
+    expect(eliminated).toEqual({ "cheap-fp4": false, "pricey-fp4": true, "pricey-fp8": false });
+    // A cheap row of better quantization still sets the baseline.
+    const cheapBf16 = ep("cheap-bf16", { quantization: "bf16" });
+    expect(rank([cheapBf16, ep("pricey-fp8", { quantization: "fp8", pricing: pricey })]).at(-1)?.priceEliminated).toBe(
+      true,
+    );
+  });
+
+  test("a row with no equal-or-better quantization in the top tier is never price-eliminated", () => {
+    const pricey = { prompt: "0.000003", input_cache_read: "0.0000003", completion: "0.000012" };
+    const ranked = rank([
+      ep("cheap-fp4", { quantization: "fp4" }),
+      ep("flaky-pricey", { uptime_last_1d: 80, pricing: pricey }),
+    ]);
+    expect(ranked.some(({ priceEliminated }) => priceEliminated)).toBe(false);
+  });
+
+  test("on the fixture, unknown-quantization rows are measured against unknown-quantization rows", () => {
+    const endpoints = fixtureRows.filter(isEndpoint);
+    expect(endpoints).toHaveLength(fixtureRows.length);
+    const ranked = rank(endpoints);
+    const eliminated = ranked.filter(({ priceEliminated }) => priceEliminated).map(({ endpoint }) => endpoint.tag);
+    // golf, hotel and india ($4.73) are over 2× and $1 above the cheapest fp4 row
+    // ($1.25) but not above the cheapest unknown one, so they stay; kilo ($13.25) is.
+    expect(eliminated.sort()).toEqual(["echo/fp4", "foxtrot/fp4", "juliet/fp8", "kilo"]);
+    expect(ranked.map(({ endpoint }) => endpoint.tag)).toEqual([
+      "golf",
+      "hotel",
+      "india",
+      "charlie/fp8",
+      "delta/fp8",
+      "alpha/fp4",
+      "bravo/fp4",
+      "lima",
+      "kilo",
+      "juliet/fp8",
+      "echo/fp4",
+      "foxtrot/fp4",
+    ]);
   });
 
   test("full ties fall back to the tag, so output is deterministic", () => {

@@ -13,7 +13,8 @@ export const UPTIME_SATURATION = 98;
 export const TURN_OUTPUT_TOKENS = 300;
 /**
  * An endpoint ranks after all others when its reference run costs more than
- * this multiple of the cheapest in the most reliable tier...
+ * this multiple of the cheapest in the most reliable tier with equal or better
+ * quantization...
  */
 export const PRICE_ELIM_RATIO = 2;
 /** ...and also more than this many dollars extra. Smaller gaps are noise. */
@@ -27,6 +28,16 @@ export const REFERENCE_RUN = { prompt: 500_000, cacheRead: 15_000_000, completio
 /** An endpoint missing any of these silently degrades agent loops, so it is ineligible. */
 export const TOOL_CHOICE_MODES = ["none", "auto", "required", "function"] as const;
 export const COUNTRY = /^[A-Z]{2}$/;
+/**
+ * Quantizations from lowest to highest precision; values in one group rank
+ * equal. Unknown, missing and unlisted values rank above every group: an
+ * undisclosed quantization is treated as full precision.
+ */
+export const QUANT_ORDER: readonly (readonly string[])[] = [
+  ["fp4", "nvfp4", "int4"],
+  ["fp6", "fp8", "int8"],
+  ["bf16", "fp16", "fp32"],
+];
 
 export type ToolChoiceMode = (typeof TOOL_CHOICE_MODES)[number];
 type Percentiles = { p50?: number | null; p75?: number | null; p90?: number | null; p99?: number | null };
@@ -157,6 +168,13 @@ const reliabilityKey = (ep: Endpoint): number[] => [
   desc(uptimeBucket(ep.uptime_last_30m) ?? uptimeBucket(ep.uptime_last_1d)),
 ];
 
+/** An endpoint's place in QUANT_ORDER; higher is more precise. */
+export function quantLevel(ep: Endpoint): number {
+  const quantization = ep.quantization?.toLowerCase() ?? "";
+  const level = QUANT_ORDER.findIndex((group) => group.includes(quantization));
+  return level === -1 ? QUANT_ORDER.length : level;
+}
+
 function compareKeys(a: readonly number[], b: readonly number[]): number {
   for (let i = 0; i < a.length; i++) {
     if (a[i] !== b[i]) return a[i]! < b[i]! ? -1 : 1;
@@ -169,27 +187,34 @@ export function rank(endpoints: readonly Endpoint[]): Ranked[] {
   const eligible = endpoints.filter((ep) => ineligibleReasons(ep).length === 0);
   if (!eligible.length) return [];
 
-  // Price guard baseline: the cheapest endpoint in the most reliable tier, the
-  // cost of a choice that gives up nothing on uptime. Anything far pricier
-  // ranks after every endpoint that isn't, keeping its order among its peers.
+  // Price guard baseline: the cheapest endpoint in the most reliable tier with
+  // equal or better quantization, the cost of a choice that gives up nothing on
+  // uptime or precision. Anything far pricier ranks after every endpoint that
+  // isn't, keeping its order among its peers. An endpoint with no such
+  // baseline is never eliminated.
   const best = eligible.map(reliabilityKey).reduce((a, b) => (compareKeys(a, b) <= 0 ? a : b));
-  const topTierCosts = eligible
+  const topTier = eligible
     .filter((ep) => compareKeys(reliabilityKey(ep), best) === 0)
-    .map(referenceRunCost)
-    .filter((cost) => cost !== undefined);
-  const cheapest = Math.min(...topTierCosts);
+    .map((ep) => ({ level: quantLevel(ep), cost: referenceRunCost(ep) }));
+  const baseline = (ep: Endpoint): number => {
+    const level = quantLevel(ep);
+    const costs = topTier.filter((row) => row.level >= level).map(({ cost }) => cost);
+    return Math.min(...costs.filter((cost) => cost !== undefined));
+  };
 
   const key = ({ endpoint: ep, cost, priceEliminated }: Ranked): number[] => [
     priceEliminated ? 1 : 0,
     ...reliabilityKey(ep),
     asc(turnMs(ep)),
     asc(metric(ep.latency_last_30m?.p50)), // when throughput is unknown
+    desc(quantLevel(ep)),
     desc(metric(ep.max_completion_tokens)), // output headroom
     asc(cost), // price only breaks ties
   ];
   return eligible
     .map((endpoint): Ranked => {
       const cost = referenceRunCost(endpoint);
+      const cheapest = baseline(endpoint);
       const priceEliminated =
         cost !== undefined &&
         Number.isFinite(cheapest) &&
