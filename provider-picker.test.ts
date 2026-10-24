@@ -51,6 +51,7 @@ describe("parseOptions", () => {
       excludeCountries: [],
       zdr: false,
       verify: false,
+      probe: [],
       json: false,
       pick: false,
       help: false,
@@ -787,5 +788,124 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(models[0].ineligible).toEqual([
       { endpoint: "broken", provider: "broken", zdr: true, reasons: ["status -2"] },
     ]);
+  });
+});
+
+describe("--probe", () => {
+  const KEY = "sk-or-v1-test-secret-key";
+  const CALL = { type: "function", function: { name: "ok", arguments: "{}" } };
+  // cf lacks most modes in its listing and is ineligible; cf/fp8 is a longer sibling tag.
+  const list = [
+    ep("cf", { provider_name: "Cloudflare", supports_tool_choice: { auto: true } }),
+    ep("cf/fp8", { provider_name: "Cloudflare" }),
+  ];
+
+  async function run(argv: string[], reply: (mode: unknown) => unknown, key: string | null = KEY) {
+    const bodies: { provider: unknown; tool_choice: unknown }[] = [];
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input: unknown, init: RequestInit = {}) => {
+      const url = String(input);
+      if (url.endsWith("/endpoints")) return new Response(JSON.stringify({ data: { endpoints: list } }));
+      if (!url.endsWith("/chat/completions")) return new Response(JSON.stringify({ data: [] }));
+      const body = JSON.parse(String(init.body));
+      bodies.push(body);
+      return new Response(JSON.stringify(reply(body.tool_choice)));
+    }) as unknown as typeof fetch);
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    const saved = { key: process.env.OPENROUTER_API_KEY, home: process.env.HOME, xdg: process.env.XDG_DATA_HOME };
+    if (key === null) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = key;
+    process.env.HOME = "/nonexistent";
+    delete process.env.XDG_DATA_HOME;
+    try {
+      const code = await main(argv);
+      return { code, bodies, stdout: log.mock.calls.flat().join("\n") };
+    } finally {
+      for (const [name, value] of [
+        ["OPENROUTER_API_KEY", saved.key],
+        ["HOME", saved.home],
+        ["XDG_DATA_HOME", saved.xdg],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      fetchMock.mockRestore();
+      log.mockRestore();
+      error.mockRestore();
+    }
+  }
+
+  const good = (mode: unknown) => ({
+    provider: "Cloudflare",
+    choices: [
+      mode === "none" || mode === "auto"
+        ? { finish_reason: "stop", message: { content: "hi" } }
+        : { finish_reason: "tool_calls", message: { tool_calls: [CALL] } },
+    ],
+  });
+
+  test("parses a repeatable flag and rejects bad combinations", () => {
+    expect(parseOptions(["m/x", "--probe", "a", "--probe", "b/c"]).probe).toEqual(["a", "b/c"]);
+    expect(parseOptions(["m/x"]).probe).toEqual([]);
+    for (const argv of [
+      ["--probe", "a"],
+      ["m/x", "n/y", "--probe", "a"],
+      ["m/x", "--probe", "a", "--verify"],
+      ["m/x", "--probe", "a", "--pick"],
+      ["m/x", "--probe", "a", "--json"],
+      ["m/x", "--probe"],
+    ]) {
+      expect(() => parseOptions(argv)).toThrow();
+    }
+  });
+
+  test("usage errors exit 2", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await main(["m/x", "--probe", "a", "--verify"])).toBe(2);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  test("no key exits 2 and sends no chat request", async () => {
+    const { code, bodies } = await run(["m/x", "--probe", "cf"], good, null);
+    expect(code).toBe(2);
+    expect(bodies).toHaveLength(0);
+  });
+
+  test("probes an ineligible endpoint with its pin and the four modes, exiting 0", async () => {
+    const { code, bodies, stdout } = await run(["m/x", "--probe", "CF"], good);
+    expect(code).toBe(0);
+    expect(bodies.map((b) => b.tool_choice)).toEqual([
+      "none",
+      "auto",
+      "required",
+      { type: "function", function: { name: "ok" } },
+    ]);
+    for (const b of bodies) expect(b.provider).toEqual({ only: ["cf"], ignore: ["cf/fp8"], allow_fallbacks: false });
+    expect(stdout).toContain("cf  none  ok  listed: no");
+    expect(stdout).toContain("cf  auto  ok  listed: yes");
+  });
+
+  test("a failing mode exits 1, and a tool call under none fails", async () => {
+    const withCall = {
+      provider: "Cloudflare",
+      choices: [{ finish_reason: "tool_calls", message: { tool_calls: [CALL] } }],
+    };
+    const { code, stdout } = await run(["m/x", "--probe", "cf"], (mode) => (mode === "none" ? withCall : good(mode)));
+    expect(code).toBe(1);
+    expect(stdout).toContain("cf  none  fail  listed: no  tool call despite tool_choice none");
+    const noCall = { provider: "Cloudflare", choices: [{ finish_reason: "stop", message: {} }] };
+    const missing = await run(["m/x", "--probe", "cf"], (mode) => (typeof mode === "object" ? noCall : good(mode)));
+    expect(missing.code).toBe(1);
+    expect(missing.stdout).toContain("no ok tool call despite tool_choice function, finish=stop");
+  });
+
+  test("an unknown tag exits 1 without requests", async () => {
+    const { code, bodies, stdout } = await run(["m/x", "--probe", "nope"], good);
+    expect(code).toBe(1);
+    expect(bodies).toHaveLength(0);
+    expect(stdout).toContain("nope: no such endpoint for m/x");
   });
 });
