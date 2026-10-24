@@ -84,11 +84,11 @@ Eligibility:
                                 known location are kept and shown with "?".
       --zdr                     Keep only zero-data-retention endpoints.
 
-Probes (paid requests; 3-minute budget shared):
+Probes (paid requests):
       --verify                  Send a tiny request that must call a tool through
                                 each candidate's pin, best first, until one
                                 serves. A busy endpoint is retried once, then
-                                skipped.
+                                skipped. Stops starting probes after 3 minutes.
       --probe <tag>             With one model, send four paid requests to the
                                 endpoint with this exact tag, whatever its
                                 eligibility: tool_choice none, auto, required

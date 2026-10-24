@@ -351,7 +351,7 @@ describe("main", () => {
       expect(await main([])).toBe(2);
       expect(await main(["--help"])).toBe(0);
       const help = String(log.mock.calls[0]?.[0]);
-      const headings = ["Models:", "Eligibility:", "Probes (", "Output:", "Auth:", "Exit status:"];
+      const headings = ["Models:", "Eligibility:", "Probes (paid requests)", "Output:", "Auth:", "Exit status:"];
       const at = headings.map((heading) => help.indexOf(`\n${heading}`));
       expect(at.every((index) => index > 0)).toBe(true);
       expect(at).toEqual([...at].sort((a, b) => a - b));
