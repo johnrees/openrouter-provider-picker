@@ -11,20 +11,28 @@
     "default": "high",
     "rules": [
       {
-        "labels": ["model:fable-*"],
+        "labels": ["model:fable*"],
         "effort": "xhigh"
       },
       {
-        "labels": ["model:opus-*", "effort:xhigh"],
+        "labels": ["model:opus*", "effort:xhigh"],
         "effort": "xhigh"
       },
       {
-        "labels": ["model:opus-*", "effort:max"],
+        "labels": ["model:opus*", "effort:max"],
         "effort": "xhigh"
       }
     ]
   },
   "checks": ["bun install --frozen-lockfile", "bun test", "bun check", "bun fmt --check"],
   "waiver_label": "review-waived",
-  "block_on": "changes_requested"
+  "block_on": "changes_requested",
+  "status_writer": "actions",
+  "claims": {
+    "label": "claimed"
+  },
+  "queue": {
+    "label": "ready",
+    "priority_labels": ["P0", "P1", "P2", "P3"]
+  }
 }
