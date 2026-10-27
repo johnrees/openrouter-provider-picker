@@ -8,7 +8,10 @@ import {
   ineligibleReasons,
   locationReasons,
   matchesProvider,
+  PRICE_FLOOR_USD,
+  PRICE_WEIGHT,
   PROBE_TTL_DAYS,
+  priceFactor,
   perMillion,
   pinRouting,
   probedFor,
@@ -168,12 +171,19 @@ describe("rank", () => {
   });
 
   test("missing speed data sorts last, then headroom and price break ties", () => {
-    const unknown = ep("unknown", { latency_last_30m: null, throughput_last_30m: null });
-    const roomy = ep("roomy", { max_completion_tokens: 200_000 });
+    // With no speed figures there is nothing to weigh a price against.
+    const unmeasured = { latency_last_30m: null, throughput_last_30m: null };
+    const roomy = ep("roomy", { ...unmeasured, max_completion_tokens: 200_000 });
     const cheap = ep("cheap", {
+      ...unmeasured,
       pricing: { prompt: "0.0000005", input_cache_read: "0.00000005", completion: "0.000002" },
     });
-    expect(tags([unknown, ep("plain"), roomy, cheap])).toEqual(["roomy", "cheap", "plain", "unknown"]);
+    expect(tags([ep("plain", unmeasured), roomy, cheap, ep("measured")])).toEqual([
+      "measured",
+      "roomy",
+      "cheap",
+      "plain",
+    ]);
   });
 
   test("an endpoint both >2x and >$1 pricier than the cheapest reliable one ranks after all others", () => {
@@ -429,5 +439,93 @@ describe("an unreported 30-minute window", () => {
   test("still ranks above a measured failure", () => {
     const failing = ep("failing", { uptime_last_30m: 90, latency_last_30m: { p50: 100 } });
     expect(tags([failing, quiet])).toEqual(["quiet", "failing"]);
+  });
+});
+
+describe("price against speed", () => {
+  // ep()'s defaults: a 3.5 s turn (500 ms + 300 tokens at 100 tok/s) for $2.12 a reference run.
+  const cheap = ep("cheap");
+  const priced = (multiple: number) => ({
+    prompt: String(0.000001 * multiple),
+    input_cache_read: String(0.0000001 * multiple),
+    completion: String(0.000004 * multiple),
+  });
+
+  test("twice the price loses to a few tens of milliseconds' less speed", () => {
+    // Exactly 2× and $2.12 more: the price guard spares it by equality, and it was 40 ms faster.
+    const double = ep("double", { pricing: priced(2), latency_last_30m: { p50: 460 } });
+    const ranked = rank([double, cheap]);
+    expect(ranked.map(({ endpoint, priceEliminated }) => [endpoint.tag, priceEliminated])).toEqual([
+      ["cheap", false],
+      ["double", false],
+    ]);
+  });
+
+  test("a much faster endpoint at a modest premium still wins", () => {
+    // 1.25× the price for a 2.5 s turn: 2.5 × √1.25 ≈ 2.8 s against 3.5 s.
+    const fast = ep("fast", { pricing: priced(1.25), throughput_last_30m: { p50: 150 } });
+    expect(tags([cheap, fast])).toEqual(["fast", "cheap"]);
+  });
+
+  test(`at α = ${PRICE_WEIGHT}, twice the price needs a turn about 29% shorter`, () => {
+    // 3.5 s / √2 ≈ 2.47 s is the break-even turn.
+    const at = (tps: number) => ep("double", { pricing: priced(2), throughput_last_30m: { p50: tps } });
+    expect(tags([cheap, at(160)])).toEqual(["double", "cheap"]); // 2.375 s, 32% shorter: 3.36 s weighted
+    expect(tags([cheap, at(150)])).toEqual(["cheap", "double"]); // 2.5 s, 29% shorter: 3.54 s
+    expect(priceFactor(4, 2)).toBeCloseTo(Math.SQRT2);
+    expect(priceFactor(8, 2)).toBeCloseTo(2); // 4× the price needs half the turn
+    expect(priceFactor(2.65, 2.12)).toBeCloseTo(1.118, 3); // 1.25× needs about 11% less
+  });
+
+  test("the cheaper of two equally fast endpoints wins", () => {
+    expect(tags([ep("pricier", { pricing: priced(1.1) }), cheap])).toEqual(["cheap", "pricier"]);
+  });
+
+  test("price weighs the time to first token when throughput is unknown", () => {
+    const slowStart = ep("a-cheap", { throughput_last_30m: null, latency_last_30m: { p50: 1000 } });
+    const quickStart = ep("b-double", {
+      throughput_last_30m: null,
+      latency_last_30m: { p50: 900 },
+      pricing: priced(2),
+    });
+    expect(tags([quickStart, slowStart])).toEqual(["a-cheap", "b-double"]);
+  });
+
+  test("a free endpoint's price counts as PRICE_FLOOR_USD, so a paid one's factor stays finite", () => {
+    expect(priceFactor(0, 0)).toBe(1);
+    expect(priceFactor(PRICE_FLOOR_USD / 2, 0)).toBe(1);
+    expect(priceFactor(2.12, 0)).toBeCloseTo(Math.sqrt(2.12 / PRICE_FLOOR_USD));
+    // $0.85 a run is under the price guard's $1, so only the weighting can put a 15.5 s free turn first.
+    const free = ep("free", { pricing: priced(0), throughput_last_30m: { p50: 20 } });
+    const low = ep("low", { pricing: priced(0.4) });
+    expect(rank([low, free]).map(({ endpoint, priceEliminated }) => [endpoint.tag, priceEliminated])).toEqual([
+      ["free", false],
+      ["low", false],
+    ]);
+    // Two free endpoints tie on price, so speed decides.
+    expect(tags([free, ep("free-fast", { pricing: priced(0) })])).toEqual(["free-fast", "free"]);
+  });
+
+  test("an unknown price ranks after the known ones of its tier, then by speed", () => {
+    const unpricedFast = ep("unpriced-fast", { pricing: {}, latency_last_30m: { p50: 100 } });
+    const unpricedSlow = ep("unpriced-slow", { pricing: {}, latency_last_30m: { p50: 900 } });
+    const flaky = ep("flaky", { uptime_last_1d: 80, latency_last_30m: { p50: 1 } });
+    // Even a priced row with no speed figures, which can't be weighed either, ranks first.
+    const unmeasured = ep("unmeasured", { latency_last_30m: null, throughput_last_30m: null });
+    expect(tags([flaky, unpricedSlow, unpricedFast, unmeasured, cheap])).toEqual([
+      "cheap",
+      "unmeasured",
+      "unpriced-fast",
+      "unpriced-slow",
+      "flaky",
+    ]);
+  });
+
+  test("price never crosses a reliability tier", () => {
+    const flakyFree = ep("flaky-free", { uptime_last_1d: 80, pricing: priced(0) });
+    expect(tags([flakyFree, ep("reliable-pricey", { pricing: priced(1.9) })])).toEqual([
+      "reliable-pricey",
+      "flaky-free",
+    ]);
   });
 });

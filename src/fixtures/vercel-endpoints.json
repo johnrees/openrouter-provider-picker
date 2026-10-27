@@ -136,7 +136,7 @@
         "uptime_last_1h": 100,
         "uptime_last_1d": 99.5,
         "latency_last_1h": { "p50": 300, "p95": 800 },
-        "throughput_last_1h": { "p50": 100, "p95": 130 },
+        "throughput_last_1h": { "p50": 150, "p95": 180 },
         "supports_implicit_caching": true,
         "inference_regions": [
           {

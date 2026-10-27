@@ -20,6 +20,18 @@ export const PRICE_ELIM_RATIO = 2;
 /** ...and also more than this many dollars extra. Smaller gaps are noise. */
 export const PRICE_ELIM_DELTA_USD = 1;
 /**
+ * Within a reliability tier, speed is weighed against price: turn time is
+ * multiplied by (reference run / cheapest reference run) to this power. At
+ * 0.5, twice the price must buy a turn about 29% shorter (1/√2) to rank
+ * above, 4× the price half the turn, and 1.25× about 11%.
+ */
+export const PRICE_WEIGHT = 0.5;
+/**
+ * A reference run cheaper than this counts as costing this when prices are
+ * weighed, so a free endpoint gives a paid one a finite factor.
+ */
+export const PRICE_FLOOR_USD = 0.01;
+/**
  * Token mix of a long agentic session, used to compare prices as one number.
  * Agent loops resend their context, so cache reads dominate: measured sessions
  * read 6M to 29M cached tokens against 0.1M to 2M fresh.
@@ -309,6 +321,10 @@ const reliabilityKey = (ep: Endpoint): number[] => [
   desc(uptimeBucket(ep.uptime_last_30m) === undefined ? 0 : 1),
 ];
 
+/** How much longer a turn counts for at `cost` than at `cheapest`: their ratio to the power PRICE_WEIGHT. */
+export const priceFactor = (cost: number, cheapest: number): number =>
+  (Math.max(cost, PRICE_FLOOR_USD) / Math.max(cheapest, PRICE_FLOOR_USD)) ** PRICE_WEIGHT;
+
 const UNKNOWN_QUANT_LEVEL = QUANT_ORDER.findIndex((group) => group.includes("unknown"));
 
 /** An endpoint's place in QUANT_ORDER; higher is more precise. */
@@ -355,16 +371,26 @@ export function rank(endpoints: readonly Endpoint[], probed: ReadonlyMap<string,
     return Math.min(...costs.filter((cost) => cost !== undefined));
   };
 
-  const key = ({ endpoint: ep, cost, priceEliminated }: Ranked): number[] => [
-    priceEliminated ? 1 : 0,
-    ...reliabilityKey(ep),
-    ep.tool_choice_unverified ? 1 : 0, // within a reliability tier, verified tool_choice first
-    asc(turnMs(ep)),
-    asc(metric(ep.latency_last_30m?.p50)), // when throughput is unknown
-    desc(quantLevel(ep)),
-    desc(metric(ep.max_completion_tokens)), // output headroom
-    asc(cost), // price only breaks ties
-  ];
+  // Speed weighed against price. Every row shares one cheapest price, so the
+  // choice of it scales the weighted times without changing their order. A
+  // row with an unknown price can't be weighed, so it follows every priced
+  // row of its tier, ordered among its peers by unweighted speed.
+  const cheapest = Math.min(...eligible.map(referenceRunCost).filter((cost) => cost !== undefined));
+  const key = ({ endpoint: ep, cost, priceEliminated }: Ranked): number[] => {
+    const factor = cost === undefined ? 1 : priceFactor(cost, cheapest);
+    const weighted = (ms: number | undefined) => (ms === undefined ? undefined : ms * factor);
+    return [
+      priceEliminated ? 1 : 0,
+      ...reliabilityKey(ep),
+      ep.tool_choice_unverified ? 1 : 0, // within a reliability tier, verified tool_choice first
+      cost === undefined ? 1 : 0,
+      asc(weighted(turnMs(ep))),
+      asc(weighted(metric(ep.latency_last_30m?.p50))), // when throughput is unknown
+      desc(quantLevel(ep)),
+      desc(metric(ep.max_completion_tokens)), // output headroom
+      asc(cost), // without speed figures, price breaks ties
+    ];
+  };
   return eligible
     .map((endpoint): Ranked => {
       const cost = referenceRunCost(endpoint);
