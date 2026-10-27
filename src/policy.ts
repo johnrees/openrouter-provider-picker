@@ -296,11 +296,17 @@ const desc = (value: number | undefined): number => (value === undefined ? Infin
 /**
  * The 1-day window outranks the 30-minute one: a clean day beats a clean half
  * hour. An endpoint with no traffic in the last 30 minutes has no 30-minute
- * uptime, so its day stands in rather than ranking it below a measured failure.
+ * uptime, so its day stands in rather than ranking it below a measured failure;
+ * but a half hour that was measured beats one that was assumed, so a quiet
+ * endpoint never outranks a busy one on speed alone.
  */
+const uptimeKey = (ep: Endpoint): number[] => {
+  const day = uptimeBucket(ep.uptime_last_1d);
+  return [desc(day), desc(uptimeBucket(ep.uptime_last_30m) ?? day)];
+};
 const reliabilityKey = (ep: Endpoint): number[] => [
-  desc(uptimeBucket(ep.uptime_last_1d)),
-  desc(uptimeBucket(ep.uptime_last_30m) ?? uptimeBucket(ep.uptime_last_1d)),
+  ...uptimeKey(ep),
+  desc(uptimeBucket(ep.uptime_last_30m) === undefined ? 0 : 1),
 ];
 
 const UNKNOWN_QUANT_LEVEL = QUANT_ORDER.findIndex((group) => group.includes("unknown"));
@@ -337,9 +343,9 @@ export function rank(endpoints: readonly Endpoint[], probed: ReadonlyMap<string,
   // baseline is never eliminated. A row with unverified tool_choice gives up
   // verification, so it sets the baseline only for other unverified rows and
   // can't eliminate a verified one.
-  const best = eligible.map(reliabilityKey).reduce((a, b) => (compareKeys(a, b) <= 0 ? a : b));
+  const best = eligible.map(uptimeKey).reduce((a, b) => (compareKeys(a, b) <= 0 ? a : b));
   const topTier = eligible
-    .filter((ep) => compareKeys(reliabilityKey(ep), best) === 0)
+    .filter((ep) => compareKeys(uptimeKey(ep), best) === 0)
     .map((ep) => ({ level: quantLevel(ep), cost: referenceRunCost(ep), unverified: ep.tool_choice_unverified }));
   const baseline = (ep: Endpoint): number => {
     const level = quantLevel(ep);

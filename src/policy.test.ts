@@ -288,11 +288,11 @@ describe("rank", () => {
     expect(ranked.map(({ endpoint }) => endpoint.tag)).toEqual([
       "golf",
       "hotel",
-      "india",
       "charlie/fp8",
       "delta/fp8",
       "alpha/fp4",
       "bravo/fp4",
+      "india", // no 30-minute uptime: after every measured row of its tier, before lima's 97.4% day
       "lima",
       "kilo",
       "juliet/fp8",
@@ -413,5 +413,21 @@ describe("gateways", () => {
       ignore: ["fireworks/fast"],
       allow_fallbacks: false,
     });
+  });
+});
+
+describe("an unreported 30-minute window", () => {
+  // A quiet endpoint has no 30-minute uptime, so its clean day stands in and it
+  // ties a busy one; before this key it then won on a faster first token.
+  const busy = ep("busy", { uptime_last_30m: 100, latency_last_30m: { p50: 900 } });
+  const quiet = ep("quiet", { uptime_last_30m: undefined, latency_last_30m: { p50: 300 } });
+
+  test("loses the tie to a measured clean half hour, whatever the speed", () => {
+    expect(tags([quiet, busy])).toEqual(["busy", "quiet"]);
+  });
+
+  test("still ranks above a measured failure", () => {
+    const failing = ep("failing", { uptime_last_30m: 90, latency_last_30m: { p50: 100 } });
+    expect(tags([failing, quiet])).toEqual(["quiet", "failing"]);
   });
 });
