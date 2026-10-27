@@ -110,14 +110,18 @@ Gateway adds no markup; `$run` includes neither.
    Vercel, whose speed figures are hourly too). 98% or more counts as fully up.
    An endpoint with no traffic in the window keeps its day's figure, but loses
    the tie to one that was measured in the window.
-3. **Then speed:** estimated time for a 300-token agent turn (time to first
-   token plus streaming). When uptime and speed tie, higher quantization wins:
-   fp4 < fp8 < not reported < bf16.
-4. **Price only when it's far higher:** an endpoint costing more than 2× _and_
+3. **Then speed weighed against price:** estimated time for a 300-token agent
+   turn (time to first token plus streaming), multiplied by
+   (`$run` / cheapest `$run`)^0.5. So twice the price must buy a turn about 29%
+   shorter, and four times the price half the turn. A `$run` under $0.01 counts
+   as $0.01, so a free endpoint doesn't make every other price infinitely
+   worse; one with no price ranks after the priced ones. When this ties, higher
+   quantization wins: fp4 < fp8 < not reported < bf16.
+4. **Far higher prices drop out:** an endpoint costing more than 2× _and_
    more than $1 above the cheapest fully reliable one of equal or better
    quantization, per reference agentic session, drops to the bottom
    (`price-elim`). So a cheap fp4 endpoint never eliminates an fp8 one, and a
-   `tc?` row never eliminates a verified one. Otherwise price only breaks ties.
+   `tc?` row never eliminates a verified one.
 
 Quantization comes only from the gateway's listing. An endpoint that doesn't
 report one is assumed close to full precision, which metadata can't confirm, so

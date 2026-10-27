@@ -50,6 +50,8 @@ import {
   type Options,
   PRICE_ELIM_DELTA_USD,
   PRICE_ELIM_RATIO,
+  PRICE_FLOOR_USD,
+  PRICE_WEIGHT,
   perMillion,
   PROBE_TTL_DAYS,
   type Probed,
@@ -152,6 +154,9 @@ Output:
   and above fp8; a pin on one says "quantization not reported" (--json:
   pick.quantizationReported false). One with no uptime for the last 30 minutes
   keeps its day's figure but ranks after an endpoint measured in the window.
+  Within an uptime tier, speed is weighed against price: turn time times
+  ($run / cheapest $run)^${PRICE_WEIGHT}, so twice the price must buy a turn about
+  ${Math.round((1 - 2 ** -PRICE_WEIGHT) * 100)}% shorter. An endpoint with no price ranks after the priced ones.
 
 Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential;
 ${VERCEL_KEY_VAR} for Vercel probes.
@@ -1184,8 +1189,8 @@ export async function main(argv: string[]): Promise<number> {
     );
     console.log(
       `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties; measured beats unreported) > ${vercel ? "verified tool_choice > " : ""}` +
-        "turn_s > ttfb > quant > maxout > $run, " +
-        `price-elim last; turn_s = ttfb + ${TURN_OUTPUT_TOKENS} tokens at tok/s; ` +
+        `priced > turn_s × ($run / cheapest $run)^${PRICE_WEIGHT} > ttfb × the same > quant > maxout > $run, ` +
+        `price-elim last; turn_s = ttfb + ${TURN_OUTPUT_TOKENS} tokens at tok/s; $run counts as at least $${PRICE_FLOOR_USD}; ` +
         `quant fp4 < fp8 < ? (not reported) < bf16`,
     );
     console.log(
