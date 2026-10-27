@@ -150,7 +150,8 @@ Output:
   -h, --help                    Show this help
   An endpoint whose listing doesn't report its quantization ranks below bf16
   and above fp8; a pin on one says "quantization not reported" (--json:
-  pick.quantizationReported false).
+  pick.quantizationReported false). One with no uptime for the last 30 minutes
+  keeps its day's figure but ranks after an endpoint measured in the window.
 
 Auth: OPENROUTER_API_KEY, else opencode's stored OpenRouter credential;
 ${VERCEL_KEY_VAR} for Vercel probes.
@@ -1182,7 +1183,7 @@ export async function main(argv: string[]): Promise<number> {
         (options.zdr ? ", ZDR only" : ""),
     );
     console.log(
-      `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties) > ${vercel ? "verified tool_choice > " : ""}` +
+      `# rank: uptime 1d > uptime 30m (>=${UPTIME_SATURATION}% ties; measured beats unreported) > ${vercel ? "verified tool_choice > " : ""}` +
         "turn_s > ttfb > quant > maxout > $run, " +
         `price-elim last; turn_s = ttfb + ${TURN_OUTPUT_TOKENS} tokens at tok/s; ` +
         `quant fp4 < fp8 < ? (not reported) < bf16`,

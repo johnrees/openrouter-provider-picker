@@ -108,6 +108,8 @@ Gateway adds no markup; `$run` includes neither.
    row of its uptime tier; `--verify` is the proof.
 2. **Uptime first:** the last day, then the last 30 minutes (the last hour on
    Vercel, whose speed figures are hourly too). 98% or more counts as fully up.
+   An endpoint with no traffic in the window keeps its day's figure, but loses
+   the tie to one that was measured in the window.
 3. **Then speed:** estimated time for a 300-token agent turn (time to first
    token plus streaming). When uptime and speed tie, higher quantization wins:
    fp4 < fp8 < not reported < bf16.
