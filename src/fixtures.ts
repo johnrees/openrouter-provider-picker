@@ -1,4 +1,5 @@
 import response from "./fixtures/endpoints.json";
+import opencodeGoResponse from "./fixtures/opencode-go-models.json";
 import vercelResponse from "./fixtures/vercel-endpoints.json";
 import type { Endpoint } from "./policy.ts";
 
@@ -10,6 +11,12 @@ import type { Endpoint } from "./policy.ts";
  */
 export const vercelFixture = vercelResponse;
 export const vercelFixtureRows: unknown[] = vercelResponse.data.endpoints;
+
+/**
+ * A hand-written GET /models response from OpenCode Go with invented model ids: glm-5.3, which matches the
+ * OpenRouter slug z-ai/glm-5.3 used in the tests, and two others, one with capitals in its id.
+ */
+export const opencodeGoFixture = opencodeGoResponse;
 
 /**
  * Rows of a hand-written GET /models/{slug}/endpoints response for an anonymous

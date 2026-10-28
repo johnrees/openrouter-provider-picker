@@ -47,6 +47,7 @@ opp z-ai/glm-5.3 -e inference-net  # never rank or pick InferenceNet
 opp z-ai/glm-5.3 -p baseten,together  # only these providers' endpoints (a view: ranking still sees all)
 opp z-ai/glm-5.3 --json     # machine-readable
 opp z-ai/glm-5.3 --gateway openrouter,vercel  # rank OpenRouter's and Vercel AI Gateway's endpoints in one table
+opp z-ai/glm-5.3-flash --gateway openrouter,opencode-go --verify  # add OpenCode Go's model, measured by a live probe
 ```
 
 `opp --help` lists every option.
@@ -54,8 +55,9 @@ opp z-ai/glm-5.3 --gateway openrouter,vercel  # rank OpenRouter's and Vercel AI 
 Set `OPENROUTER_API_KEY`, or have opencode logged in to OpenRouter. Without a
 key, OpenRouter hides latency and throughput, so speed can't be ranked. Listing
 Vercel's endpoints needs no key; `--verify` on them needs `AI_GATEWAY_API_KEY`.
-Each key is only sent to its own gateway and never printed. `--gateway all`
-skips a gateway whose key the run needs but lacks, and says so. When Vercel
+OpenCode Go's model list needs `OPENCODE_GO_KEY`, even without `--verify`; so do
+its probes. Each key is only sent to its own gateway and never printed.
+`--gateway all` skips a gateway whose key the run needs but lacks, and says so. When Vercel
 answers a probe with HTTP 401 or 403 (a bad key, no card on file, or a free tier
 without the model), `--verify` stops probing Vercel and prints its message once.
 
@@ -94,6 +96,19 @@ Some slugs differ between the two (`z-ai` is `zai`, `together` is `togetherai`,
 `-p`, `-e` and `-x` accept either. OpenRouter adds 5.5% (min $0.80) to card credit purchases and Vercel AI
 Gateway adds no markup; `$run` includes neither.
 
+OpenCode Go can't be pinned: it names no provider, so its pick has no routing.
+`--pick` prints `opencode-go:<go id>`, the `pin:` line says "not pinnable", and
+`--json` gives `pick.routing` null and a `pinnable` flag on every ranked row.
+Go lists a model by the model part of the OpenRouter slug (`glm-5.3-flash` for
+`z-ai/glm-5.3-flash`), lowercase and exact; a model it lacks is noted as
+`opencode-go: not listed`. Go is a flat-rate subscription. It publishes no
+latency, price or uptime, so its row shows `-` for them, and `--verify` probes
+every Go row once and fills `ttfb` from the probe. The probe's cost is the plan
+allowance Go reports for the request (`--json`: `probes[].ttfbMs` and `cost`).
+`--probe` takes `--gateway opencode-go` too. Some Go models need the workspace
+privacy setting "Global regions" and otherwise fail with HTTP 400, shown in the
+probe line.
+
 ## How it picks
 
 1. **Eligible:** native tools, status 0, and every `tool_choice` mode. Missing
@@ -105,7 +120,10 @@ Gateway adds no markup; `$run` includes neither.
    OpenRouter's verdict for the same provider: a mode counts only if every
    OpenRouter endpoint of that provider lists it. A row whose provider isn't on
    OpenRouter stays eligible, flagged `tc?`, and ranks after every verified
-   row of its uptime tier; `--verify` is the proof.
+   row of its uptime tier; `--verify` is the proof. An OpenCode Go row has no
+   figures at all, so it is flagged `tc?` too and ranks after every row that has
+   uptime, but before a `price-elim` one. Without `--verify` it is picked only
+   when no other row is ranked.
 2. **Uptime first:** the last day, then the last 30 minutes (the last hour on
    Vercel, whose speed figures are hourly too). 98% or more counts as fully up.
    An endpoint with no traffic in the window keeps its day's figure, but loses
