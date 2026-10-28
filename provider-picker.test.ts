@@ -1902,6 +1902,18 @@ describe("--gateway", () => {
         expect(alone).toMatchObject({ code: 0, stdout: GO_ROW });
       });
 
+      test("a Go row above a price-eliminated row still isn't picked while another row is ranked", async () => {
+        // -p hides the cheap row after ranking, so the price-eliminated one is all that is left beside Go's.
+        const pricey = { prompt: "0.00001", input_cache_read: "0.000001", completion: "0.00004" };
+        const list = [ep("cheap"), ep("costly", { pricing: pricey })];
+        const flags = ["--gateway", "openrouter,opencode-go", "-p", "costly,glm-5.3"];
+        const model = await jsonModel(flags, { ...withKey, list });
+        expect(ids(model.ranked)).toEqual([GO_ROW, "openrouter:costly"]);
+        expect(model.ranked[1].priceEliminated).toBe(true);
+        expect(model.pick.endpoint).toBe("costly");
+        expect((await run([SLUG, ...flags, "--pick"], { ...withKey, list })).stdout).toBe("costly");
+      });
+
       test("a Go pick has no routing in --json, and its pin is the Go id", async () => {
         const model = await jsonModel(["--gateway", "opencode-go"], withKey);
         expect(model.pick).toEqual({

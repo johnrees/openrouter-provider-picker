@@ -110,8 +110,9 @@ Sources:
   opencode-go lists the model whose id is the slug's model part (glm-5.3 for
   z-ai/glm-5.3), if your Go plan has it. Go publishes no providers, prices or
   uptime, so its row is flagged tc?, ranks after every row with figures, and
-  can't be pinned: its pick has no routing. --verify probes every Go row and
-  shows its ttfb and cost (the plan allowance the probe used).
+  can't be pinned: its pick has no routing. Without --verify it is picked only
+  when no other row is ranked. --verify probes every Go row and shows its ttfb
+  and cost (the plan allowance the probe used).
 
 Eligibility:
   -p, --provider <name,...>     Show only endpoints whose provider name or tag
@@ -672,8 +673,14 @@ function auditWorstCase(endpoints: readonly Endpoint[], n: number): number | und
   return n * ((AUDIT_PROMPT_TOKENS * input + PROBE_MAX_TOKENS * output) / 1_000_000 + fee);
 }
 
+/**
+ * The pick: the first endpoint to serve under --verify, else the best ranked. A Go row ranks above price-eliminated
+ * rows, but without a probe it is picked only when no other row is ranked.
+ */
 const pickOf = (report: Report): Endpoint | undefined =>
-  report.verification ? report.verification.verified : report.ranked[0]?.endpoint;
+  report.verification
+    ? report.verification.verified
+    : (report.ranked.find(({ endpoint }) => pinnable(endpoint)) ?? report.ranked[0])?.endpoint;
 
 const budgetNote = `--verify stops after ${VERIFY_BUDGET_MS / 60_000} minutes`;
 

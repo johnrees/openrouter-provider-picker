@@ -122,7 +122,8 @@ probe line.
    OpenRouter stays eligible, flagged `tc?`, and ranks after every verified
    row of its uptime tier; `--verify` is the proof. An OpenCode Go row has no
    figures at all, so it is flagged `tc?` too and ranks after every row that has
-   uptime, but before a `price-elim` one.
+   uptime, but before a `price-elim` one. Without `--verify` it is picked only
+   when no other row is ranked.
 2. **Uptime first:** the last day, then the last 30 minutes (the last hour on
    Vercel, whose speed figures are hourly too). 98% or more counts as fully up.
    An endpoint with no traffic in the window keeps its day's figure, but loses
