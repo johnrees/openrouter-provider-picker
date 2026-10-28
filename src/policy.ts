@@ -60,7 +60,7 @@ export const AUDIT_PROMPT_TOKENS = 200;
 export const AUDIT_MAX_USD = 0.5;
 
 /** Where opp can list a model's endpoints, in the order their rows are fetched and shown. */
-export const GATEWAYS = ["openrouter", "vercel"] as const;
+export const GATEWAYS = ["openrouter", "vercel", "opencode-go"] as const;
 
 export type Gateway = (typeof GATEWAYS)[number];
 export type ToolChoiceMode = (typeof TOOL_CHOICE_MODES)[number];
@@ -133,6 +133,9 @@ export type Probe = {
   at: string;
   /** The status (401 or 403) with which Vercel refused the account: no other endpoint there can serve this run. */
   refused?: number;
+  /** OpenCode Go only: ms from the request until the reply's headers arrived, and the allowance the reply charged, in USD. */
+  ttfbMs?: number;
+  cost?: number;
 };
 /**
  * `unprobed` counts the candidates left untried when the time budget ran out. `halted` lists each gateway
@@ -213,6 +216,9 @@ export function freshProbes(store: ProbeStore, slug: string, now: number): Map<s
 }
 
 export const gatewayOf = (ep: Endpoint): Gateway => ep.gateway ?? "openrouter";
+
+/** Whether a request can be restricted to this endpoint. OpenCode Go names no provider, so none of its rows can. */
+export const pinnable = (ep: Endpoint): boolean => gatewayOf(ep) !== "opencode-go";
 
 /** An endpoint's fresh probe results. Stored probes are keyed by OpenRouter tag, so they apply to OpenRouter rows only. */
 export const probedFor = (probed: ReadonlyMap<string, Probed>, ep: Endpoint): Probed | undefined =>
