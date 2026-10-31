@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fmtRate, main, parseOptions, resolveAuth } from "./provider-picker.ts";
-import { ep, vercelFixture } from "./src/fixtures.ts";
+import { ep, opencodeGoFixture, vercelFixture } from "./src/fixtures.ts";
 import type { Endpoint } from "./src/policy.ts";
 
 /** A new, empty XDG_CACHE_HOME, so probe results never reach the real store or leak between runs. */
@@ -1196,7 +1196,7 @@ describe("completion", () => {
     const zsh = await run(["--completions", "zsh"], ok);
     expect(zsh.code).toBe(0);
     expect(zsh.stdout.startsWith("#compdef opp")).toBe(true);
-    expect(zsh.stdout).toContain("'*--gateway[where to list endpoints]:gateway:(openrouter vercel all)'");
+    expect(zsh.stdout).toContain("'*--gateway[where to list endpoints]:gateway:(openrouter vercel opencode-go all)'");
     expect(zsh.fetches).toBe(0);
     const bash = await run(["--completions", "bash"], ok);
     expect(bash.code).toBe(2);
@@ -1250,6 +1250,8 @@ describe("--gateway", () => {
   const AI_KEY = "test-ai-gateway-secret";
   const SLUG = "z-ai/glm-5.3";
   const VERCEL = "https://ai-gateway.vercel.sh/v1";
+  const GO = "https://opencode.ai/inference/go/v1";
+  const GO_KEY = "test-go-secret-key";
   // OpenRouter serves alpha (eligible, top tier), mike (lacks required and function), quebec (down, but listing every
   // mode) and lima (a lower tier). The Vercel fixture adds alpha, mike and quebec under the same names, plus oscar and
   // papa, which OpenRouter lacks.
@@ -1268,16 +1270,26 @@ describe("--gateway", () => {
     message: { tool_calls: [{ type: "function", function: { name: "ok", arguments: "{}" } }] },
   };
 
+  // Go's chat reply: a tool call, and what the plan was charged.
+  const GO_CALL = {
+    choices: [TOOL_CALL],
+    usage: { opencode: { billing_source: "go", list_cost: 0.002, allowance: 0.0012, tokens: {} } },
+  };
+
   type Call = { url: string; init: RequestInit };
   /**
    * Runs main against a fake OpenRouter and Vercel. `serve` names the provider that answers a pinned probe on
    * each gateway; by default the pinned one. `vercel` is the Vercel listing, or a function giving a raw Response.
+   * `go` is Go's model list, likewise, and `goReply` answers its chat requests; it is listed only with a `goKey`.
    */
   async function run(
     argv: string[],
     {
       orKey = OR_KEY as string | null,
       aiKey = AI_KEY as string | null,
+      goKey = null as string | null,
+      go = opencodeGoFixture as unknown,
+      goReply = (_body: Record<string, unknown>): Response => new Response(JSON.stringify(GO_CALL)),
       vercel = vercelFixture as unknown,
       providers = [] as unknown[],
       zdrList = { data: [] } as unknown,
@@ -1291,6 +1303,10 @@ describe("--gateway", () => {
     const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input: unknown, init: RequestInit = {}) => {
       const url = String(input);
       calls.push({ url, init });
+      if (url.startsWith(GO)) {
+        if (url.endsWith("/models")) return typeof go === "function" ? go() : json(go);
+        return goReply(JSON.parse(String(init.body)));
+      }
       if (url.startsWith(VERCEL)) {
         if (url.endsWith("/endpoints")) return typeof vercel === "function" ? vercel() : json(vercel);
         if (vercelReply) return vercelReply();
@@ -1311,11 +1327,12 @@ describe("--gateway", () => {
     }) as unknown as typeof fetch);
     const log = spyOn(console, "log").mockImplementation(() => {});
     const error = spyOn(console, "error").mockImplementation(() => {});
-    const names = ["OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "HOME", "XDG_DATA_HOME"] as const;
+    const names = ["OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "OPENCODE_GO_KEY", "HOME", "XDG_DATA_HOME"] as const;
     const saved = names.map((name) => [name, process.env[name]] as const);
     for (const [name, value] of [
       ["OPENROUTER_API_KEY", orKey],
       ["AI_GATEWAY_API_KEY", aiKey],
+      ["OPENCODE_GO_KEY", goKey],
       ["XDG_DATA_HOME", null],
     ] as const) {
       if (value === null) delete process.env[name];
@@ -1327,10 +1344,11 @@ describe("--gateway", () => {
       const stdout = log.mock.calls.flat().join("\n");
       const stderr = error.mock.calls.flat().join("\n");
       const toVercel = calls.filter(({ url }) => url.startsWith(VERCEL));
+      const toGo = calls.filter(({ url }) => url.startsWith(GO));
       const probes = calls
         .filter(({ url }) => url.endsWith("/chat/completions"))
         .map(({ url, init }) => ({ url, body: JSON.parse(String(init.body)) }));
-      return { code, stdout, stderr, output: `${stdout}\n${stderr}`, calls, toVercel, probes };
+      return { code, stdout, stderr, output: `${stdout}\n${stderr}`, calls, toVercel, toGo, probes };
     } finally {
       for (const [name, value] of saved) {
         if (value === undefined) delete process.env[name];
@@ -1372,7 +1390,10 @@ describe("--gateway", () => {
       [["--gateway", "cloudflare"], /cloudflare isn't supported yet/],
       [["--gateway", "vercel", "--audit-fallback", "2"], /--audit-fallback measures OpenRouter's default routing/],
       [["--gateway", "all", "--audit-fallback", "2"], /--audit-fallback measures OpenRouter's default routing/],
-      [["--gateway", "vercel", "--probe", "a"], /--probe tests OpenRouter endpoints/],
+      [["--gateway", "vercel", "--probe", "a"], /--probe tests one gateway's endpoints/],
+      [["--gateway", "openrouter,opencode-go", "--probe", "a"], /--probe tests one gateway's endpoints/],
+      [["--gateway", "all", "--probe", "a"], /--probe tests one gateway's endpoints/],
+      [["--gateway", "opencode-go", "--audit-fallback", "2"], /--audit-fallback measures OpenRouter's default routing/],
     ])("rejects %j, exiting 2", async (argv, message) => {
       expect(() => parseOptions(["m/x", ...argv])).toThrow(message);
       const { code, calls } = await run(["m/x", ...argv]);
@@ -1592,7 +1613,7 @@ describe("--gateway", () => {
       expect(code).toBe(0);
       expect(toVercel).toHaveLength(0);
       expect(stderr.split("\n").filter((line) => line.includes("vercel"))).toEqual([
-        "opp: --gateway all: skipping vercel (no AI_GATEWAY_API_KEY)",
+        "opp: --gateway all: skipping vercel (no AI_GATEWAY_API_KEY), opencode-go (no OPENCODE_GO_KEY)",
       ]);
       const json = JSON.parse(stdout);
       expect(json.gateways).toEqual(["openrouter"]);
@@ -1686,6 +1707,353 @@ describe("--gateway", () => {
         expect(model.pick.endpoint).toBe("alpha/fp8");
         // Vercel's alpha ranked between quebec and alpha/fp8, so it was skipped; oscar ranks after the pick.
         expect(model.halted).toEqual([{ gateway: "vercel", status: 403, skipped: 1 }]);
+      });
+    });
+  });
+
+  describe("opencode-go", () => {
+    const withKey = { goKey: GO_KEY };
+    const GO_ROW = "opencode-go:glm-5.3";
+    const GO_LINE = "opp: --gateway opencode-go needs OPENCODE_GO_KEY to list Go's models";
+    const refusal = (status: number, message: string) => () =>
+      new Response(JSON.stringify({ error: { message } }), { status });
+    const GATED = 'Set the workspace privacy setting to "Global regions"';
+
+    /** The whitespace-separated cells of the table row for `endpoint`, under the header's column names. */
+    function cells(stdout: string, endpoint: string): Record<string, string> {
+      const lines = stdout.split("\n");
+      const header = lines
+        .find((line) => line.includes("endpoint") && line.includes("ttfb"))!
+        .trim()
+        .split(/\s+/);
+      const row = lines.find((line) => new RegExp(`\\s${endpoint.replace(".", "\\.")}\\s`).test(line))!;
+      const values = row.trim().split(/\s+/);
+      return Object.fromEntries(header.map((name, i) => [name, values[i]!]));
+    }
+
+    test("--help names the gateway, its key and what a Go row lacks", async () => {
+      const { stdout } = await run(["--help"]);
+      expect(stdout).toContain("vercel, opencode-go, cloudflare, or all");
+      expect(stdout).toContain("OPENCODE_GO_KEY for OpenCode Go");
+      expect(stdout).toContain("can't be pinned");
+    });
+
+    describe("the key", () => {
+      test.each([[["--gateway", "opencode-go"]], [["--gateway", "openrouter,opencode-go", "--verify"]]])(
+        "%j without OPENCODE_GO_KEY exits 2 before any request",
+        async (flags) => {
+          const { code, calls, stdout, stderr } = await run([SLUG, ...flags]);
+          expect(code).toBe(2);
+          expect(calls).toHaveLength(0);
+          expect(stdout).toBe("");
+          expect(stderr).toBe(GO_LINE);
+        },
+      );
+
+      test("--gateway all skips Go on one stderr line and lists the rest", async () => {
+        const { code, stdout, stderr, toGo } = await run([SLUG, "--gateway", "all", "--json"]);
+        expect(code).toBe(0);
+        expect(toGo).toHaveLength(0);
+        expect(stderr.split("\n").filter((line) => line.includes("opencode-go"))).toEqual([
+          "opp: --gateway all: skipping opencode-go (no OPENCODE_GO_KEY)",
+        ]);
+        expect(JSON.parse(stdout).gateways).toEqual(["openrouter", "vercel"]);
+      });
+
+      test("--gateway all with the key lists Go too, and says nothing", async () => {
+        const { stdout, stderr, toGo } = await run([SLUG, "--gateway", "all", "--json"], withKey);
+        expect(JSON.parse(stdout).gateways).toEqual(["openrouter", "vercel", "opencode-go"]);
+        expect(stderr).toBe("");
+        expect(toGo).toHaveLength(1);
+      });
+
+      test("the key goes to Go alone, and never into the output, even when Go echoes it", async () => {
+        const echo = refusal(401, `Invalid key ${GO_KEY}`);
+        const { stdout, stderr, calls } = await run([SLUG, "--gateway", "openrouter,vercel,opencode-go"], {
+          ...withKey,
+          go: echo,
+        });
+        expect(stdout).toContain("  opencode-go: HTTP 401: Invalid key [redacted]");
+        expect(stdout + stderr).not.toContain(GO_KEY);
+        for (const { url, init } of calls) {
+          expect(JSON.stringify(init.headers ?? {}).includes(GO_KEY)).toBe(url.startsWith(GO));
+        }
+      });
+    });
+
+    describe("listing", () => {
+      test("a Go model is one unnamed row with every stat unknown, and no OpenRouter request is made for it", async () => {
+        const { stdout, calls } = await run([SLUG, "--gateway", "opencode-go", "--json"], withKey);
+        const [model] = JSON.parse(stdout).models;
+        expect(model.ranked).toEqual([
+          expect.objectContaining({
+            rank: 1,
+            gateway: "opencode-go",
+            endpoint: "glm-5.3",
+            provider: "glm-5.3",
+            quantization: null,
+            headquarters: null,
+            zdr: null,
+            uptime: { last1d: null, last30m: null, last5m: null },
+            turnMs: null,
+            ttfbMsP50: null,
+            tokensPerSecondP50: null,
+            maxCompletionTokens: null,
+            usdPerMillion: { input: null, cacheRead: null, output: null },
+            referenceRunUsd: null,
+            priceEliminated: false,
+            pinnable: false,
+            toolChoiceVerified: false,
+            toolChoiceSource: {
+              none: "unverified",
+              auto: "unverified",
+              required: "unverified",
+              function: "unverified",
+            },
+          }),
+        ]);
+        expect(calls.some(({ url }) => url.endsWith("/endpoints"))).toBe(false);
+        const [list] = calls.filter(({ url }) => url.startsWith(GO));
+        expect(list!.url).toBe(`${GO}/models`);
+        expect((list!.init.headers as Record<string, string>).Authorization).toBe(`Bearer ${GO_KEY}`);
+      });
+
+      test("every ranked row says whether it can be pinned", async () => {
+        const model = await jsonModel(["--gateway", "all"], withKey);
+        const pinnable = Object.fromEntries(
+          model.ranked.map((row: Row & { pinnable: boolean }) => [row.gateway, row.pinnable]),
+        );
+        expect(pinnable).toEqual({ openrouter: true, vercel: true, "opencode-go": false });
+      });
+
+      test("the id match ignores case and takes the model part alone", async () => {
+        const mixed = await run(["example/EXAMPLE-mixed", "--gateway", "opencode-go", "--pick"], withKey);
+        expect(mixed.stdout).toBe("opencode-go:Example-Mixed");
+        const other = await run(["example/glm-5", "--gateway", "opencode-go", "--pick"], withKey);
+        expect(other.code).toBe(1);
+        expect(other.stderr).toBe("opp: example/glm-5: fetch failed: opencode-go: not listed");
+      });
+
+      test("a model Go doesn't list is a note under the model, on --pick's stderr and in --json", async () => {
+        const slug = "z-ai/not-on-go";
+        const text = await run([slug, "--gateway", "openrouter,opencode-go"], withKey);
+        expect(text.code).toBe(0);
+        expect(text.stdout).toContain("  opencode-go: not listed");
+        expect(text.stdout).toContain(`pin: ${slug}:alpha/fp8`);
+        const picked = await run([slug, "--gateway", "openrouter,opencode-go", "--pick"], withKey);
+        expect(picked.stdout).toBe("alpha/fp8");
+        expect(picked.stderr).toBe(`opp: ${slug}: opencode-go: not listed`);
+        const json = JSON.parse((await run([slug, "--gateway", "openrouter,opencode-go", "--json"], withKey)).stdout);
+        expect(json.models[0].gatewayErrors).toEqual([{ gateway: "opencode-go", error: "not listed" }]);
+      });
+
+      test("with Go alone that is a fetch failure and exit 1", async () => {
+        const { code, stdout } = await run(["z-ai/not-on-go", "--gateway", "opencode-go"], withKey);
+        expect(code).toBe(1);
+        expect(stdout).toContain("fetch failed: opencode-go: not listed");
+      });
+
+      test("a failed Go fetch leaves OpenRouter's rows ranked alone", async () => {
+        const { code, stdout } = await run([SLUG, "--gateway", "openrouter,opencode-go"], {
+          ...withKey,
+          go: refusal(503, "down"),
+        });
+        expect(code).toBe(0);
+        expect(stdout).toContain("  opencode-go: HTTP 503: down");
+      });
+
+      test("the text output flags the row tc?, says it isn't pinnable and prints no routing", async () => {
+        const { stdout } = await run([SLUG, "--gateway", "opencode-go"], withKey);
+        expect(stdout).toContain("# eligible (opencode-go): native tools");
+        expect(stdout).toContain(
+          "# opencode-go rows: no listed stats; --verify fills ttfb, and its allowance is the cost",
+        );
+        expect(stdout).toContain("# tc?: tool_choice listed without per-mode support or an OpenRouter verdict");
+        expect(stdout).toContain(
+          "# fees: OpenRouter adds 5.5% (min $0.80) to card credit purchases; OpenCode Go is a flat-rate subscription. $run includes neither.",
+        );
+        expect(stdout).toMatch(/▶ +1 +glm-5\.3 .* tc\?$/m);
+        expect(stdout).toContain("  pin: glm-5.3 opencode-go:glm-5.3 (not pinnable: Go names no provider)");
+        expect(stdout).not.toContain("routing:");
+        expect(cells(stdout, "glm-5.3")).toMatchObject({ ttfb: "-", turn_s: "-", $run: "-", $in: "-" });
+      });
+
+      test("with all three gateways the fees note names each", async () => {
+        const { stdout } = await run([SLUG, "--gateway", "all"], withKey);
+        expect(stdout).toContain(
+          "# fees: OpenRouter adds 5.5% (min $0.80) to card credit purchases; Vercel AI Gateway adds no markup; " +
+            "OpenCode Go is a flat-rate subscription. $run includes none of them.",
+        );
+      });
+    });
+
+    describe("picking", () => {
+      test("without --verify a Go row ranks after every row with figures, so OpenRouter's is picked", async () => {
+        expect((await run([SLUG, "--gateway", "openrouter,opencode-go", "--pick"], withKey)).stdout).toBe("alpha/fp8");
+        const model = await jsonModel(["--gateway", "openrouter,opencode-go"], withKey);
+        expect(ids(model.ranked)).toEqual(["openrouter:alpha/fp8", "openrouter:lima", GO_ROW]);
+      });
+
+      test("Go is picked when no other listed gateway has an eligible row", async () => {
+        const down = [ep("quebec", { provider_name: "Quebec", status: -1 })];
+        const both = await run([SLUG, "--gateway", "openrouter,opencode-go", "--pick"], { ...withKey, list: down });
+        expect(both.stdout).toBe(GO_ROW);
+        const alone = await run([SLUG, "--gateway", "opencode-go", "--pick"], withKey);
+        expect(alone).toMatchObject({ code: 0, stdout: GO_ROW });
+      });
+
+      test("a Go row above a price-eliminated row still isn't picked while another row is ranked", async () => {
+        // -p hides the cheap row after ranking, so the price-eliminated one is all that is left beside Go's.
+        const pricey = { prompt: "0.00001", input_cache_read: "0.000001", completion: "0.00004" };
+        const list = [ep("cheap"), ep("costly", { pricing: pricey })];
+        const flags = ["--gateway", "openrouter,opencode-go", "-p", "costly,glm-5.3"];
+        const model = await jsonModel(flags, { ...withKey, list });
+        expect(ids(model.ranked)).toEqual([GO_ROW, "openrouter:costly"]);
+        expect(model.ranked[1].priceEliminated).toBe(true);
+        expect(model.pick.endpoint).toBe("costly");
+        expect((await run([SLUG, ...flags, "--pick"], { ...withKey, list })).stdout).toBe("costly");
+      });
+
+      test("a Go pick has no routing in --json, and its pin is the Go id", async () => {
+        const model = await jsonModel(["--gateway", "opencode-go"], withKey);
+        expect(model.pick).toEqual({
+          pin: "glm-5.3 opencode-go:glm-5.3",
+          gateway: "opencode-go",
+          model: "glm-5.3",
+          endpoint: "glm-5.3",
+          provider: "glm-5.3",
+          routing: null,
+          verified: false,
+          quantizationReported: false,
+        });
+      });
+    });
+
+    describe("--verify", () => {
+      test("probes every Go row once even when the walk stopped earlier; the first to serve is still the pick", async () => {
+        const cache = freshCache();
+        process.env.XDG_CACHE_HOME = cache;
+        const { code, stdout, probes, toGo } = await run(
+          [SLUG, "--gateway", "openrouter,opencode-go", "--verify", "--json"],
+          withKey,
+        );
+        expect(code).toBe(0);
+        expect(probes.map(({ url }) => new URL(url).host)).toEqual(["openrouter.ai", "opencode.ai"]);
+        const model = JSON.parse(stdout).models[0];
+        expect(model.pick).toMatchObject({ endpoint: "alpha/fp8", verified: true });
+        expect(model.probes).toEqual([
+          expect.objectContaining({ gateway: "openrouter", endpoint: "alpha/fp8", ok: true, ttfbMs: null, cost: null }),
+          expect.objectContaining({ gateway: "opencode-go", endpoint: "glm-5.3", ok: true, cost: 0.0012 }),
+        ]);
+        expect(Number.isInteger(model.probes[1].ttfbMs)).toBe(true);
+        expect(model.notProbed).toBe(0);
+        // The ranking keeps no latency for Go; only the probe has one.
+        const row = model.ranked.find(({ gateway }: Row) => gateway === "opencode-go");
+        expect(row.ttfbMsP50).toBeNull();
+        // Go probes are never stored, and the request names Go's id with no routing.
+        expect(readProbes(cache)).toEqual({
+          [SLUG]: { "alpha/fp8": { required: { result: "pass", at: expect.any(String) } } },
+        });
+        const request = toGo.find(({ url }) => url.endsWith("/chat/completions"))!;
+        const sent = JSON.parse(String(request.init.body));
+        expect(sent).toMatchObject({ model: "glm-5.3", tool_choice: "required" });
+        expect(sent).not.toHaveProperty("provider");
+        expect(sent).not.toHaveProperty("providerOptions");
+        const headers = request.init.headers as Record<string, string>;
+        expect(headers["User-Agent"]).toMatch(/^opp\/\d+\.\d+\.\d+/);
+        expect(headers["x-opencode-session"]).toMatch(/^[0-9a-f-]{36}$/);
+      });
+
+      test("the Go row's ttfb cell shows the probe's, and the probe line reads its allowance", async () => {
+        const { stdout } = await run([SLUG, "--gateway", "openrouter,opencode-go", "--verify"], withKey);
+        const line = stdout.match(
+          /probe opencode-go:glm-5\.3: ok \(ttfb (\d+) ms, allowance \$0\.0012, finish=tool_calls\)/,
+        );
+        expect(line).not.toBeNull();
+        expect(cells(stdout, "glm-5.3")).toMatchObject({ ttfb: line![1], "tok/s": "-", turn_s: "-", $run: "-" });
+        expect(stdout).toContain(`verified pin: ${SLUG}:alpha/fp8`);
+      });
+
+      test("a Go pick is verified through its own probe, printing no routing", async () => {
+        const { code, stdout, probes } = await run([SLUG, "--gateway", "opencode-go", "--verify"], withKey);
+        expect(code).toBe(0);
+        expect(probes).toHaveLength(1);
+        expect(stdout).toContain("verified pin: glm-5.3 opencode-go:glm-5.3 (not pinnable: Go names no provider)");
+        expect(stdout).not.toContain("routing:");
+      });
+
+      test("a region-gated model shows Go's HTTP 400 in the probe line, stays listed, and crashes nothing", async () => {
+        const goReply = refusal(400, GATED);
+        const alone = await run([SLUG, "--gateway", "opencode-go", "--verify"], { ...withKey, goReply });
+        expect(alone.code).toBe(1);
+        expect(alone.stdout).toContain(`probe opencode-go:glm-5.3: FAILED (HTTP 400 ${GATED})`);
+        expect(alone.stdout).toContain("no candidate served after 1 probe(s)");
+        expect(alone.stdout).toMatch(/ 1 +glm-5\.3 /);
+        const both = await run([SLUG, "--gateway", "openrouter,opencode-go", "--verify"], { ...withKey, goReply });
+        expect(both.code).toBe(0);
+        expect(both.stdout).toContain(`probe opencode-go:glm-5.3: FAILED (HTTP 400 ${GATED})`);
+        expect(both.stdout).toContain(`verified pin: ${SLUG}:alpha/fp8`);
+        expect(cells(both.stdout, "glm-5.3")).toMatchObject({ ttfb: "-" });
+      });
+
+      test("under --pick a failed Go probe is told once on stderr", async () => {
+        const goReply = refusal(400, GATED);
+        const { code, stdout, stderr } = await run([SLUG, "--gateway", "opencode-go", "--verify", "--pick"], {
+          ...withKey,
+          goReply,
+        });
+        expect(code).toBe(1);
+        expect(stdout).toBe("");
+        expect(stderr).toBe(`opp: ${SLUG}: no candidate served after 1 probe(s)`);
+      });
+    });
+
+    describe("--probe", () => {
+      test("sends all four modes to the Go model, prints a line each, and stores nothing", async () => {
+        const cache = freshCache();
+        process.env.XDG_CACHE_HOME = cache;
+        // A model told tool_choice none answers in text; the others call the tool.
+        const plain = { choices: [{ finish_reason: "stop", message: { content: "Done." } }], usage: GO_CALL.usage };
+        const goReply = ({ tool_choice }: Record<string, unknown>) =>
+          new Response(JSON.stringify(tool_choice === "none" ? plain : GO_CALL));
+        const { code, stdout, probes, calls } = await run([SLUG, "--probe", "glm-5.3", "--gateway", "opencode-go"], {
+          ...withKey,
+          goReply,
+          orKey: null,
+        });
+        expect(code).toBe(0);
+        expect(probes.map(({ body }) => body.tool_choice)).toEqual([
+          "none",
+          "auto",
+          "required",
+          { type: "function", function: { name: "ok" } },
+        ]);
+        expect(calls.every(({ url }) => url.startsWith(GO) || url.startsWith("https://opencode.ai"))).toBe(true);
+        expect(stdout.split("\n")).toEqual([
+          expect.stringMatching(
+            /^glm-5\.3 {2}none {2}ok {2}listed: \? {2}ttfb \d+ ms, allowance \$0\.0012, no tool call, finish=stop$/,
+          ),
+          expect.stringMatching(
+            /^glm-5\.3 {2}auto {2}ok {2}listed: \? {2}ttfb \d+ ms, allowance \$0\.0012, finish=tool_calls$/,
+          ),
+          expect.stringMatching(/^glm-5\.3 {2}required {2}ok /),
+          expect.stringMatching(/^glm-5\.3 {2}function {2}ok /),
+        ]);
+        expect(existsSync(join(cache, "opp", "probes.json"))).toBe(false);
+      });
+
+      test("an unknown tag, an unlisted model and a missing key fail without a probe", async () => {
+        const unknown = await run([SLUG, "--probe", "nope", "--gateway", "opencode-go"], withKey);
+        expect(unknown).toMatchObject({ code: 1, stdout: `nope: no such endpoint for ${SLUG}`, probes: [] });
+        const unlisted = await run(["z-ai/not-on-go", "--probe", "x", "--gateway", "opencode-go"], withKey);
+        expect(unlisted).toMatchObject({
+          code: 1,
+          stderr: "opp: z-ai/not-on-go: fetch failed: not listed",
+          probes: [],
+        });
+        const keyless = await run([SLUG, "--probe", "glm-5.3", "--gateway", "opencode-go"]);
+        expect(keyless).toMatchObject({ code: 2, stderr: GO_LINE });
+        expect(keyless.calls).toHaveLength(0);
       });
     });
   });

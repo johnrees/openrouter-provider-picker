@@ -1,7 +1,8 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { ep } from "./fixtures.ts";
 import type { ToolChoiceMode } from "./policy.ts";
-import { probe, probeBody, retryDelay, servedQuantization, toolCallProblem } from "./probe.ts";
+import { normalise } from "./opencode-go.ts";
+import { probe, probeBody, retryDelay, servedQuantization, toolCallProblem, verify } from "./probe.ts";
 
 describe("retry", () => {
   test("Retry-After sets the retry wait, capped, with a default when absent or a date", () => {
@@ -171,4 +172,167 @@ describe("inconclusive probes", () => {
       expect(outcome).toMatchObject({ ok: true, busy: false, conclusive: false });
     },
   );
+});
+
+describe("OpenCode Go probes", () => {
+  const auth = { key: "test-go-secret-key", source: "test" };
+  const go = normalise({ id: "glm-5.3" })!;
+  const call = { type: "function", function: { name: "ok", arguments: "{}" } };
+  const served = (allowance?: unknown, extra: object = {}) => ({
+    choices: [{ finish_reason: "tool_calls", message: { tool_calls: [call] } }],
+    usage: { opencode: { billing_source: "go", list_cost: 0.5, ...(allowance !== undefined && { allowance }) } },
+    ...extra,
+  });
+
+  async function probeGo(replies: (() => Response)[], mode: ToolChoiceMode = "required") {
+    let next = 0;
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      replies[next++]!()) as unknown as typeof fetch);
+    try {
+      const outcome = await probe("z-ai/glm-5.3", go, [go], auth, mode);
+      return { outcome, calls: [...fetchMock.mock.calls] as [string, RequestInit][] };
+    } finally {
+      fetchMock.mockRestore();
+    }
+  }
+  const reply = (body: unknown, init?: ResponseInit) => () => new Response(JSON.stringify(body), init);
+
+  test("the body names Go's model id and carries no routing", () => {
+    const body = probeBody("z-ai/glm-5.3", go, [go], "required");
+    expect(body.model).toBe("glm-5.3");
+    expect(body).not.toHaveProperty("provider");
+    expect(body).not.toHaveProperty("providerOptions");
+    expect(body.tool_choice).toBe("required");
+  });
+
+  test("goes to Go with its key, a user agent and one session id, and reads ttfb and the allowance", async () => {
+    const { outcome, calls } = await probeGo([reply(served(0.0012))]);
+    const [url, init] = calls[0]!;
+    expect(url).toBe("https://opencode.ai/inference/go/v1/chat/completions");
+    const headers = init.headers as Record<string, string>;
+    expect(headers.Authorization).toBe(`Bearer ${auth.key}`);
+    expect(headers["User-Agent"]).toMatch(/^opp\/\d+\.\d+\.\d+/);
+    expect(headers["x-opencode-session"]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(init.redirect).toBe("error");
+    expect(outcome).toMatchObject({ ok: true, busy: false, conclusive: true, cost: 0.0012 });
+    expect(Number.isInteger(outcome.ttfbMs)).toBe(true);
+    expect(outcome.detail).toBe(`ttfb ${outcome.ttfbMs} ms, allowance $0.0012, finish=tool_calls`);
+  });
+
+  test("the session id is the same for every request of a run", async () => {
+    const first = await probeGo([reply(served(0.001))]);
+    const second = await probeGo([reply(served(0.001))], "auto");
+    const session = (calls: [string, RequestInit][]) =>
+      (calls[0]![1].headers as Record<string, string>)["x-opencode-session"];
+    expect(session(first.calls)).toBe(session(second.calls));
+  });
+
+  test("nothing is checked about who served it: the reply names no provider and a stray one is no failure", async () => {
+    const { outcome } = await probeGo([reply(served(0.001, { provider: "someone-else", service_tier: "flex" }))]);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("a reply with no allowance still passes, with the cost unknown", async () => {
+    const { outcome } = await probeGo([reply(served())]);
+    expect(outcome).toMatchObject({ ok: true });
+    expect(outcome).not.toHaveProperty("cost");
+    expect(outcome.detail).toBe(`ttfb ${outcome.ttfbMs} ms, finish=tool_calls`);
+  });
+
+  test("a region-gated request is an HTTP 400 with Go's message: inconclusive, not busy, no figures", async () => {
+    const { outcome, calls } = await probeGo([
+      reply({ error: { message: 'Set the workspace privacy setting to "Global regions"' } }, { status: 400 }),
+    ]);
+    expect(calls).toHaveLength(1);
+    expect(outcome).toMatchObject({
+      ok: false,
+      busy: false,
+      conclusive: false,
+      detail: 'HTTP 400 Set the workspace privacy setting to "Global regions"',
+    });
+    expect(outcome).not.toHaveProperty("ttfbMs");
+    expect(outcome).not.toHaveProperty("cost");
+    expect(outcome).not.toHaveProperty("refused");
+  });
+
+  test("a rate-window error is retried like any gateway's 429, and the retry's figures are kept", async () => {
+    const limited = reply({ error: { message: "rate window used" } }, { status: 429, headers: { "retry-after": "0" } });
+    const { outcome, calls } = await probeGo([limited, reply(served(0.002))]);
+    expect(calls).toHaveLength(2);
+    expect(outcome).toMatchObject({ ok: true, cost: 0.002 });
+    expect(outcome.detail).toEndWith(", after a retry");
+    const again = await probeGo([limited, limited]);
+    expect(again.outcome).toMatchObject({ ok: false, busy: true });
+    expect(again.outcome.detail).toBe("HTTP 429 rate window used, retried");
+  });
+
+  test("a tool-call failure is judged as for any gateway, and the key never reaches the detail", async () => {
+    const text = { choices: [{ finish_reason: "stop", message: { content: `no ${auth.key}` } }] };
+    const { outcome } = await probeGo([reply(text)]);
+    expect(outcome).toMatchObject({ ok: false, conclusive: true });
+    expect(outcome.detail).toBe("no ok tool call despite tool_choice required, finish=stop");
+    const leaked = await probeGo([reply({ error: { message: `bad key ${auth.key}` } }, { status: 401 })]);
+    expect(leaked.outcome.detail).toBe("HTTP 401 bad key [redacted]");
+  });
+});
+
+describe("verify and Go rows", () => {
+  const keys = { openrouter: { key: "or", source: "t" }, "opencode-go": { key: "go", source: "t" } };
+  const go = normalise({ id: "glm-5.3" })!;
+  const rows = [ep("a"), ep("b"), go].map((endpoint) => ({ endpoint, cost: undefined, priceEliminated: false }));
+  const call = { type: "function", function: { name: "ok", arguments: "{}" } };
+
+  async function walk(deadline?: number, reply: () => Response = () => new Response(JSON.stringify(served))) {
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation((async () => reply()) as unknown as typeof fetch);
+    try {
+      const verification = await verify(
+        "z-ai/glm-5.3",
+        rows,
+        rows.map((r) => r.endpoint),
+        keys,
+        deadline,
+      );
+      return { verification, urls: fetchMock.mock.calls.map(([url]) => String(url)) };
+    } finally {
+      fetchMock.mockRestore();
+    }
+  }
+  const served = {
+    provider: "a",
+    choices: [{ finish_reason: "tool_calls", message: { tool_calls: [call] } }],
+    usage: { opencode: { allowance: 0.001 } },
+  };
+
+  test("a Go row the walk didn't reach is probed after it, and the first to serve is still the pick", async () => {
+    const { verification, urls } = await walk();
+    expect(verification.verified).toBe(rows[0]!.endpoint);
+    expect(verification.probes.map(({ endpoint }) => endpoint.tag)).toEqual(["a", "glm-5.3"]);
+    expect(urls).toEqual([
+      "https://openrouter.ai/api/v1/chat/completions",
+      "https://opencode.ai/inference/go/v1/chat/completions",
+    ]);
+    expect(verification.probes[1]).toMatchObject({ ok: true, cost: 0.001 });
+    expect(verification).not.toHaveProperty("unprobed");
+  });
+
+  test("a Go row the walk reached is probed once, not again", async () => {
+    const wrong = () => new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: {} }] }));
+    const { verification, urls } = await walk(undefined, wrong);
+    expect(verification.verified).toBeUndefined();
+    expect(verification.probes.map(({ endpoint }) => endpoint.tag)).toEqual(["a", "b", "glm-5.3"]);
+    expect(urls.filter((url) => url.includes("opencode.ai"))).toHaveLength(1);
+  });
+
+  test("a Go row left when the budget runs out is counted as not probed", async () => {
+    const now = spyOn(Date, "now");
+    now.mockReturnValueOnce(0).mockReturnValue(10_000);
+    try {
+      const { verification, urls } = await walk(1_000);
+      expect(verification.verified).toBe(rows[0]!.endpoint);
+      expect(verification.unprobed).toBe(1);
+      expect(urls).toHaveLength(1);
+    } finally {
+      now.mockRestore();
+    }
+  });
 });

@@ -17,6 +17,13 @@ import {
   type ToolChoiceMode,
   type Verification,
 } from "./policy.ts";
+import {
+  allowanceOf,
+  fmtAllowance,
+  OPENCODE_GO_API,
+  OPENCODE_GO_SESSION,
+  OPENCODE_GO_USER_AGENT,
+} from "./opencode-go.ts";
 import { servedProvider, VERCEL_API, vercelModel, vercelRouting } from "./vercel.ts";
 
 /** Generous for a one-tool-call reply; a pin that takes longer is not one to pick. */
@@ -75,6 +82,8 @@ type Attempt = {
   timedOut?: boolean;
   judged?: boolean;
   refused?: number;
+  ttfbMs?: number;
+  cost?: number;
 };
 
 const isTimeout = (error: unknown): boolean => error instanceof Error && error.name === "TimeoutError";
@@ -88,19 +97,24 @@ export function toolChoiceFor(mode: ToolChoiceMode) {
 const CHAT_URL: Record<Gateway, string> = {
   openrouter: `${API}/chat/completions`,
   vercel: `${VERCEL_API}/chat/completions`,
+  "opencode-go": `${OPENCODE_GO_API}/chat/completions`,
 };
 
 /**
  * The probe request body: one tiny completion pinned to `ep` in its gateway's syntax, with the given
  * tool_choice mode. With no `ep` it carries no routing preferences, so OpenRouter's default routing chooses
- * the provider.
+ * the provider. A Go request names Go's model id and no routing, since Go can't pin a provider.
  */
 export function probeBody(slug: string, ep: Endpoint | null, endpoints: readonly Endpoint[], mode: ToolChoiceMode) {
-  const vercel = ep !== null && gatewayOf(ep) === "vercel";
+  const gateway = ep === null ? "openrouter" : gatewayOf(ep);
   const routing: { provider?: object; providerOptions?: object } =
-    ep === null ? {} : vercel ? { providerOptions: vercelRouting(ep) } : { provider: pinRouting(ep, endpoints) };
+    ep === null || gateway === "opencode-go"
+      ? {}
+      : gateway === "vercel"
+        ? { providerOptions: vercelRouting(ep) }
+        : { provider: pinRouting(ep, endpoints) };
   return {
-    model: vercel ? vercelModel(slug) : slug,
+    model: gateway === "vercel" ? vercelModel(slug) : gateway === "opencode-go" ? ep!.tag : slug,
     ...routing,
     max_tokens: PROBE_MAX_TOKENS,
     // Eligibility trusts the endpoint's advertised tool support, so the probe exercises it.
@@ -186,6 +200,7 @@ export async function probe(
       detail: first.detail,
       at: new Date().toISOString(),
       ...(first.refused !== undefined && { refused: first.refused }),
+      ...measured(first),
     };
   }
   await new Promise((resolve) => setTimeout(resolve, first.retryInMs));
@@ -199,8 +214,15 @@ export async function probe(
     at: new Date().toISOString(),
     detail: `${second.detail}, ${second.ok ? "after a retry" : "retried"}`,
     ...(second.refused !== undefined && { refused: second.refused }),
+    ...measured(second),
   };
 }
+
+/** The figures a Go attempt measured, when it measured any. */
+const measured = ({ ttfbMs, cost }: Attempt) => ({
+  ...(ttfbMs !== undefined && { ttfbMs }),
+  ...(cost !== undefined && { cost }),
+});
 
 async function attempt(
   slug: string,
@@ -215,14 +237,22 @@ async function attempt(
     ...(retryInMs !== undefined && { retryInMs }),
   });
   const verdict = (ok: boolean, detail: string): Attempt => ({ ...result(ok, detail), judged: true });
+  const go = gatewayOf(ep) === "opencode-go";
   try {
+    const started = performance.now();
     const res = await fetch(CHAT_URL[gatewayOf(ep)], {
       method: "POST",
-      headers: { Authorization: `Bearer ${auth.key}`, "Content-Type": "application/json" },
+      headers: {
+        Authorization: `Bearer ${auth.key}`,
+        "Content-Type": "application/json",
+        ...(go && { "User-Agent": OPENCODE_GO_USER_AGENT, "x-opencode-session": OPENCODE_GO_SESSION }),
+      },
       redirect: "error",
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       body: JSON.stringify(probeBody(slug, ep, endpoints, mode)),
     });
+    // A non-streamed reply, so the time to the headers is the whole reply's latency.
+    const ttfbMs = Math.round(performance.now() - started);
     // A body that is not JSON is judged below. A failure while reading it, such as a timeout or a reset, is no reply.
     const text = await res.text();
     const body = ((): ChatResponse | null => {
@@ -252,25 +282,31 @@ async function attempt(
     }
     // Pinning makes this unreachable unless the gateway changes semantics. Check anyway, since verifying is the point.
     // OpenRouter names the provider in `provider`; Vercel in its gateway metadata's routing.finalProvider.
+    // Go names none and pins none, so there is nothing to check.
     const vercel = gatewayOf(ep) === "vercel";
     const named = vercel ? servedProvider(body) : typeof body?.provider === "string" ? body.provider : undefined;
     const servedBy = named ?? "an unknown provider";
-    if (servedBy.toLowerCase() !== ep.provider_name.toLowerCase()) return result(false, `served by ${servedBy}`);
+    if (!go && servedBy.toLowerCase() !== ep.provider_name.toLowerCase()) return result(false, `served by ${servedBy}`);
     // A provider's tier endpoints share its name, so check the tier too. Responses call the standard tier "default".
     const tier = body?.service_tier;
     const want = ep.service_tier ?? "default";
-    if (!vercel && typeof tier === "string" && tier !== want) {
+    if (!go && !vercel && typeof tier === "string" && tier !== want) {
       return result(false, `served at tier ${tier}, expected ${want}`);
     }
     const problem = toolCallProblem(body, mode);
     const finish = String(body?.choices?.[0]?.finish_reason ?? "none");
     const ok = problem === undefined;
-    const detail = problem ?? `served by ${servedBy}${mode === "none" ? ", no tool call" : ""}, finish=${finish}`;
+    // Go's own figures: the reply's latency, and what it charged the plan.
+    const cost = go ? allowanceOf(body) : undefined;
+    const figures = go ? [`ttfb ${ttfbMs} ms`, ...(cost === undefined ? [] : [`allowance ${fmtAllowance(cost)}`])] : [];
+    const served = go ? figures.join(", ") : `served by ${servedBy}`;
+    const detail = problem ?? `${served}${mode === "none" ? ", no tool call" : ""}, finish=${finish}`;
     // An unfinished, errored or filtered reply says nothing about tool_choice support, and nor does one cut off
     // by the token budget, except for a tool call under none. Those fail or pass for this run but are not stored.
     const unfinished = problem?.startsWith("no finished completion") === true;
     const cutOff = finish === "length" && (ok || mode !== "none");
-    return (unfinished || cutOff ? result : verdict)(ok, detail);
+    const outcome = (unfinished || cutOff ? result : verdict)(ok, detail);
+    return go ? { ...outcome, ttfbMs, ...(cost !== undefined && { cost }) } : outcome;
   } catch (error) {
     // No reply at all, from a timeout, reset or DNS failure, is no evidence about the endpoint.
     return { ...result(false, errorMessage(error)), ...(isTimeout(error) && { timedOut: true }) };
@@ -280,7 +316,9 @@ async function attempt(
 /**
  * Probes candidates in rank order and stops at the first that serves. Each probe uses the key of its
  * endpoint's gateway, so a key only ever goes to its own gateway. Once a gateway refuses the account, its
- * remaining candidates are skipped and the walk goes on through the other gateways' candidates.
+ * remaining candidates are skipped and the walk goes on through the other gateways' candidates. A Go row's
+ * probe is its only source of figures, so once the walk stops, any Go row it did not reach is probed too,
+ * within the same deadline; the pick is still the first to serve.
  */
 export async function verify(
   slug: string,
@@ -292,6 +330,7 @@ export async function verify(
   const probes: Probe[] = [];
   const halted: NonNullable<Verification["halted"]> = [];
   const result = (rest: Partial<Verification>): Verification => ({ probes, ...(halted.length && { halted }), ...rest });
+  let verified: Endpoint | undefined;
   for (const [i, { endpoint }] of candidates.entries()) {
     if (Date.now() >= deadline) return result({ unprobed: candidates.length - i });
     const gateway = gatewayOf(endpoint);
@@ -308,10 +347,22 @@ export async function verify(
     }
     const outcome = await probe(slug, endpoint, endpoints, auth);
     probes.push(outcome);
-    if (outcome.ok) return result({ verified: endpoint });
+    if (outcome.ok) {
+      verified = endpoint;
+      break;
+    }
     if (outcome.refused !== undefined) halted.push({ gateway, status: outcome.refused, skipped: 0 });
   }
-  return result({});
+  if (verified === undefined) return result({});
+  const rest = candidates.filter(
+    ({ endpoint }) => gatewayOf(endpoint) === "opencode-go" && !probes.some((p) => p.endpoint === endpoint),
+  );
+  for (const [i, { endpoint }] of rest.entries()) {
+    if (Date.now() >= deadline) return result({ verified, unprobed: rest.length - i });
+    const auth = keys["opencode-go"];
+    if (auth) probes.push(await probe(slug, endpoint, endpoints, auth));
+  }
+  return result({ verified });
 }
 
 /**
