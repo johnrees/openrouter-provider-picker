@@ -29,6 +29,7 @@ describe("parseOptions", () => {
       excludeProviders: [],
       excludeCountries: [],
       zdr: false,
+      preferPrecision: false,
       verify: false,
       probe: [],
       json: false,
@@ -50,6 +51,10 @@ describe("parseOptions", () => {
 
   test("provider filters are split, trimmed and deduplicated", () => {
     expect(parseOptions(["m/x", "-p", "a,b", "-p", " c", "--provider", "a"]).providers).toEqual(["a", "b", "c"]);
+  });
+
+  test("--prefer-precision sets preferPrecision", () => {
+    expect(parseOptions(["m/x", "--prefer-precision"]).preferPrecision).toBe(true);
   });
 
   test("--help needs no model", () => {
@@ -540,6 +545,18 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(json.models[0].ineligible).toContainEqual(
       expect.objectContaining({ endpoint: "together", reasons: ["excluded: together"] }),
     );
+  });
+
+  test("--prefer-precision changes the pick, and --json records the flag on the pick", async () => {
+    const dearer = { pricing: { prompt: "0.0000012", input_cache_read: "0.00000012", completion: "0.0000048" } };
+    const list = [
+      ep("fp4", { quantization: "fp4" }),
+      ep("fp8", { quantization: "fp8", ...dearer }), // 20% dearer at equal speed
+    ];
+    const pick = async (...flags: string[]) =>
+      JSON.parse((await run(() => undefined, ["m/x", "--json", ...flags], ZDR_LIST, { list })).stdout).models[0].pick;
+    expect(await pick()).toMatchObject({ endpoint: "fp4", preferPrecision: false });
+    expect(await pick("--prefer-precision")).toMatchObject({ endpoint: "fp8", preferPrecision: true });
   });
 
   test("-e removes the excluded endpoint from the price guard's baseline", async () => {
@@ -1515,6 +1532,7 @@ describe("--gateway", () => {
     const json = JSON.parse(stdout);
     expect(json.gateways).toEqual(["openrouter", "vercel"]);
     expect(json.models[0].pick).toEqual({
+      preferPrecision: false,
       pin: "zai/glm-5.3 vercel:quebec",
       gateway: "vercel",
       model: "zai/glm-5.3",
@@ -1917,6 +1935,7 @@ describe("--gateway", () => {
       test("a Go pick has no routing in --json, and its pin is the Go id", async () => {
         const model = await jsonModel(["--gateway", "opencode-go"], withKey);
         expect(model.pick).toEqual({
+          preferPrecision: false,
           pin: "glm-5.3 opencode-go:glm-5.3",
           gateway: "opencode-go",
           model: "glm-5.3",

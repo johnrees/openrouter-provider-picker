@@ -54,6 +54,13 @@ export const QUANT_ORDER: readonly (readonly string[])[] = [
   ["unknown"],
   ["bf16", "fp16", "fp32"],
 ];
+/**
+ * With --prefer-precision, each step up QUANT_ORDER divides an endpoint's score by this. The score is turn
+ * time × (price ratio)^PRICE_WEIGHT, so one divisor B tolerates a turn B times longer but a price B^(1/PRICE_WEIGHT)
+ * = B² times higher. B = √1.25 ≈ 1.118 makes 25% on price the exact limit, and a turn about 12% longer
+ * (throughput about 89%) the limit on speed. A row that doesn't report its quantization gets no step over fp8.
+ */
+export const QUANT_BONUS = Math.sqrt(1.25);
 /** --audit-fallback's prompt tokens per request when bounding its cost. A measured request used 137. */
 export const AUDIT_PROMPT_TOKENS = 200;
 /** --audit-fallback refuses to start when its worst case over every model exceeds this many dollars. */
@@ -184,6 +191,8 @@ export type Options = {
   excludeProviders: string[];
   excludeCountries: string[];
   zdr: boolean;
+  /** --prefer-precision: a higher-precision endpoint ranks first when it costs up to 25% more or runs about 89% as fast. */
+  preferPrecision?: boolean;
   verify: boolean;
   probe: string[];
   json: boolean;
@@ -346,6 +355,12 @@ export function quantLevel(ep: Endpoint): number {
  */
 export const quantizationReported = (ep: Endpoint): boolean => quantLevel(ep) !== UNKNOWN_QUANT_LEVEL;
 
+/** Steps up QUANT_ORDER that earn QUANT_BONUS: reported precision only, so unknown counts as fp8 and bf16 is one step above. */
+function bonusSteps(ep: Endpoint): number {
+  const level = quantLevel(ep);
+  return level >= UNKNOWN_QUANT_LEVEL ? level - 1 : level;
+}
+
 function compareKeys(a: readonly number[], b: readonly number[]): number {
   for (let i = 0; i < a.length; i++) {
     if (a[i] !== b[i]) return a[i]! < b[i]! ? -1 : 1;
@@ -354,7 +369,11 @@ function compareKeys(a: readonly number[], b: readonly number[]): number {
 }
 
 /** Ranks eligible endpoints best first and drops the ineligible ones. */
-export function rank(endpoints: readonly Endpoint[], probed: ReadonlyMap<string, Probed> = new Map()): Ranked[] {
+export function rank(
+  endpoints: readonly Endpoint[],
+  probed: ReadonlyMap<string, Probed> = new Map(),
+  { preferPrecision = false }: { preferPrecision?: boolean } = {},
+): Ranked[] {
   const eligible = endpoints.filter((ep) => ineligibleReasons(ep, probedFor(probed, ep)).length === 0);
   if (!eligible.length) return [];
 
@@ -384,7 +403,8 @@ export function rank(endpoints: readonly Endpoint[], probed: ReadonlyMap<string,
   const cheapest = Math.min(...eligible.map(referenceRunCost).filter((cost) => cost !== undefined));
   const key = ({ endpoint: ep, cost, priceEliminated }: Ranked): number[] => {
     const factor = cost === undefined ? 1 : priceFactor(cost, cheapest);
-    const weighted = (ms: number | undefined) => (ms === undefined ? undefined : ms * factor);
+    const bonus = preferPrecision ? QUANT_BONUS ** bonusSteps(ep) : 1;
+    const weighted = (ms: number | undefined) => (ms === undefined ? undefined : (ms * factor) / bonus);
     return [
       priceEliminated ? 1 : 0,
       ...reliabilityKey(ep),

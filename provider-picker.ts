@@ -128,6 +128,10 @@ Eligibility:
                                 Repeatable or comma-separated. Providers with no
                                 known location are kept and shown with "?".
       --zdr                     Keep only zero-data-retention endpoints.
+      --prefer-precision        Rank a higher-precision endpoint first when it
+                                costs up to 25% more or runs at about 89% of
+                                the speed. Unreported quantization gets no
+                                bonus over fp8.
 
 Probes (paid requests):
       --verify                  Send a tiny request that must call a tool through
@@ -221,6 +225,7 @@ export function parseOptions(argv: string[]): Options {
       "exclude-provider": { type: "string", short: "e", multiple: true },
       "exclude-country": { type: "string", short: "x", multiple: true },
       zdr: { type: "boolean" },
+      "prefer-precision": { type: "boolean" },
       verify: { type: "boolean" },
       probe: { type: "string", multiple: true },
       "audit-fallback": { type: "string" },
@@ -273,6 +278,7 @@ export function parseOptions(argv: string[]): Options {
     excludeProviders,
     excludeCountries: [...new Set(excludeCountries)],
     zdr: values.zdr ?? false,
+    preferPrecision: values["prefer-precision"] ?? false,
     verify: values.verify ?? false,
     probe,
     json: values.json ?? false,
@@ -305,6 +311,7 @@ _${NAME}() {
     '*'{-e,--exclude-provider}'[never rank or pick these providers]:provider:' \\
     '*'{-x,--exclude-country}'[drop providers in these countries]:country code:' \\
     '--zdr[keep only zero-data-retention endpoints]' \\
+    '--prefer-precision[rank higher precision first when it costs up to 25% more or runs about 89% as fast]' \\
     '--verify[prove the pick serves and makes a tool call]' \\
     '*--probe[test tool_choice modes on one endpoint]:endpoint tag:' \\
     '--audit-fallback[measure default routing]:requests (1-${AUDIT_MAX_REQUESTS}):' \\
@@ -585,6 +592,7 @@ async function buildReport(slug: string, ctx: Context): Promise<Report> {
     const ranked = rank(
       endpoints.filter((ep) => !excludedBy(ep).length),
       probed,
+      { preferPrecision: options.preferPrecision },
     ).filter(({ endpoint }) => kept(endpoint));
     const ineligible = endpoints
       .filter(kept)
@@ -956,6 +964,7 @@ function reportJson(report: Report, ctx: Context) {
     ...(report.gatewayErrors && { gatewayErrors: report.gatewayErrors }),
     pick: pick
       ? {
+          preferPrecision: ctx.options.preferPrecision ?? false,
           pin: pinOf(pick, report.slug),
           gateway: gatewayOf(pick),
           model: modelOn(pick, report.slug),

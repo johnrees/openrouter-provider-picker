@@ -16,6 +16,7 @@ import {
   pinRouting,
   probedFor,
   quantizationReported,
+  QUANT_BONUS,
   quantLevel,
   probeOverrides,
   rank,
@@ -527,5 +528,67 @@ describe("price against speed", () => {
       "reliable-pricey",
       "flaky-free",
     ]);
+  });
+});
+
+describe("preferPrecision", () => {
+  /** An endpoint whose three prices, and so its reference run, are `k` times ep()'s; `speed` scales its throughput. */
+  const row = (tag: string, quantization: string, k = 1, speed = 1) =>
+    ep(tag, {
+      quantization,
+      throughput_last_30m: { p50: 100 * speed },
+      latency_last_30m: { p50: 0 },
+      pricing: { prompt: String(1e-6 * k), input_cache_read: String(1e-7 * k), completion: String(4e-6 * k) },
+    });
+  const order = (endpoints: Endpoint[], preferPrecision = true) =>
+    rank(endpoints, new Map(), { preferPrecision }).map(({ endpoint }) => endpoint.tag);
+
+  test("QUANT_BONUS is the root of the 25% price limit", () => {
+    expect(QUANT_BONUS ** 2).toBeCloseTo(1.25, 10);
+  });
+
+  test("a higher-precision row up to 25% dearer wins at equal speed; 30% dearer loses", () => {
+    expect(order([row("fp4", "fp4"), row("fp8", "fp8", 1.2)])).toEqual(["fp8", "fp4"]);
+    expect(order([row("fp4", "fp4"), row("fp8", "fp8", 1.3)])).toEqual(["fp4", "fp8"]);
+  });
+
+  test("a higher-precision row at 90% of the throughput wins at equal price; at 80% it loses", () => {
+    expect(order([row("fp4", "fp4"), row("fp8", "fp8", 1, 0.9)])).toEqual(["fp8", "fp4"]);
+    expect(order([row("fp4", "fp4"), row("fp8", "fp8", 1, 0.8)])).toEqual(["fp4", "fp8"]);
+  });
+
+  test("bf16 over fp8 follows the same limits", () => {
+    expect(order([row("fp8", "fp8"), row("bf16", "bf16", 1.2)])).toEqual(["bf16", "fp8"]);
+    expect(order([row("fp8", "fp8"), row("bf16", "bf16", 1.3)])).toEqual(["fp8", "bf16"]);
+    expect(order([row("fp8", "fp8"), row("bf16", "bf16", 1, 0.9)])).toEqual(["bf16", "fp8"]);
+    expect(order([row("fp8", "fp8"), row("bf16", "bf16", 1, 0.8)])).toEqual(["fp8", "bf16"]);
+  });
+
+  test("an unreported quantization gets no bonus over fp8", () => {
+    const unknown = { ...row("unk", "fp8", 1.2) } as Endpoint;
+    delete unknown.quantization;
+    expect(order([row("fp8", "fp8"), unknown])).toEqual(["fp8", "unk"]);
+    expect(order([row("fp4", "fp4"), unknown])).toEqual(["unk", "fp4"]);
+  });
+
+  test("the price-elim rule is unchanged: a row over twice the price and $1 dearer still ranks last", () => {
+    const rows = [row("fp8", "fp8"), row("fp4", "fp4", 3)];
+    const eliminated = (preferPrecision: boolean) =>
+      rank(rows, new Map(), { preferPrecision }).map(({ endpoint, priceEliminated }) => [
+        endpoint.tag,
+        priceEliminated,
+      ]);
+    expect(eliminated(true)).toEqual([
+      ["fp8", false],
+      ["fp4", true],
+    ]);
+    expect(eliminated(true)).toEqual(eliminated(false));
+  });
+
+  test("without the flag the order is the default one", () => {
+    const rows = [row("fp4", "fp4"), row("fp8", "fp8", 1.2), row("bf16", "bf16", 1, 0.9), row("slow", "fp4", 1, 0.5)];
+    expect(order(rows, false)).toEqual(tags(rows));
+    expect(order(rows, false)).toEqual(["fp4", "fp8", "bf16", "slow"]);
+    expect(rank(rows, new Map(), {})).toEqual(rank(rows));
   });
 });
