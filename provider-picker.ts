@@ -960,7 +960,6 @@ function reportJson(report: Report, ctx: Context) {
   const pick = pickOf(report);
   return {
     model: report.slug,
-    preferPrecision: ctx.options.preferPrecision ?? false,
     ...(report.error === undefined ? {} : { error: report.error }),
     ...(report.gatewayErrors && { gatewayErrors: report.gatewayErrors }),
     pick: pick

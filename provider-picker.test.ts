@@ -1532,6 +1532,7 @@ describe("--gateway", () => {
     const json = JSON.parse(stdout);
     expect(json.gateways).toEqual(["openrouter", "vercel"]);
     expect(json.models[0].pick).toEqual({
+      preferPrecision: false,
       pin: "zai/glm-5.3 vercel:quebec",
       gateway: "vercel",
       model: "zai/glm-5.3",
@@ -1934,6 +1935,7 @@ describe("--gateway", () => {
       test("a Go pick has no routing in --json, and its pin is the Go id", async () => {
         const model = await jsonModel(["--gateway", "opencode-go"], withKey);
         expect(model.pick).toEqual({
+          preferPrecision: false,
           pin: "glm-5.3 opencode-go:glm-5.3",
           gateway: "opencode-go",
           model: "glm-5.3",
