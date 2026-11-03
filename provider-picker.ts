@@ -965,6 +965,7 @@ function reportJson(report: Report, ctx: Context) {
     ...(report.gatewayErrors && { gatewayErrors: report.gatewayErrors }),
     pick: pick
       ? {
+          preferPrecision: ctx.options.preferPrecision ?? false,
           pin: pinOf(pick, report.slug),
           gateway: gatewayOf(pick),
           model: modelOn(pick, report.slug),

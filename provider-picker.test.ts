@@ -547,10 +547,16 @@ describe("end to end against a mocked OpenRouter", () => {
     );
   });
 
-  test("--json records whether --prefer-precision was on", async () => {
-    const on = JSON.parse((await run(() => undefined, ["m/x", "--json", "--prefer-precision"])).stdout);
-    const off = JSON.parse((await run(() => undefined, ["m/x", "--json"])).stdout);
-    expect([on.models[0].preferPrecision, off.models[0].preferPrecision]).toEqual([true, false]);
+  test("--prefer-precision changes the pick, and --json records the flag on the pick", async () => {
+    const dearer = { pricing: { prompt: "0.0000012", input_cache_read: "0.00000012", completion: "0.0000048" } };
+    const list = [
+      ep("fp4", { quantization: "fp4" }),
+      ep("fp8", { quantization: "fp8", ...dearer }), // 20% dearer at equal speed
+    ];
+    const pick = async (...flags: string[]) =>
+      JSON.parse((await run(() => undefined, ["m/x", "--json", ...flags], ZDR_LIST, { list })).stdout).models[0].pick;
+    expect(await pick()).toMatchObject({ endpoint: "fp4", preferPrecision: false });
+    expect(await pick("--prefer-precision")).toMatchObject({ endpoint: "fp8", preferPrecision: true });
   });
 
   test("-e removes the excluded endpoint from the price guard's baseline", async () => {
