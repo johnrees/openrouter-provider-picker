@@ -574,8 +574,14 @@ describe("preferPrecision", () => {
   test("the price-elim rule is unchanged: a row over twice the price and $1 dearer still ranks last", () => {
     const rows = [row("fp8", "fp8"), row("fp4", "fp4", 3)];
     const eliminated = (preferPrecision: boolean) =>
-      rank(rows, new Map(), { preferPrecision }).map(({ endpoint, priceEliminated }) => [endpoint.tag, priceEliminated]);
-    expect(eliminated(true)).toEqual([["fp8", false], ["fp4", true]]);
+      rank(rows, new Map(), { preferPrecision }).map(({ endpoint, priceEliminated }) => [
+        endpoint.tag,
+        priceEliminated,
+      ]);
+    expect(eliminated(true)).toEqual([
+      ["fp8", false],
+      ["fp4", true],
+    ]);
     expect(eliminated(true)).toEqual(eliminated(false));
   });
 
