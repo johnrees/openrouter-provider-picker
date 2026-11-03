@@ -29,6 +29,7 @@ describe("parseOptions", () => {
       excludeProviders: [],
       excludeCountries: [],
       zdr: false,
+      preferPrecision: false,
       verify: false,
       probe: [],
       json: false,
@@ -50,6 +51,10 @@ describe("parseOptions", () => {
 
   test("provider filters are split, trimmed and deduplicated", () => {
     expect(parseOptions(["m/x", "-p", "a,b", "-p", " c", "--provider", "a"]).providers).toEqual(["a", "b", "c"]);
+  });
+
+  test("--prefer-precision sets preferPrecision", () => {
+    expect(parseOptions(["m/x", "--prefer-precision"]).preferPrecision).toBe(true);
   });
 
   test("--help needs no model", () => {
@@ -540,6 +545,12 @@ describe("end to end against a mocked OpenRouter", () => {
     expect(json.models[0].ineligible).toContainEqual(
       expect.objectContaining({ endpoint: "together", reasons: ["excluded: together"] }),
     );
+  });
+
+  test("--json records whether --prefer-precision was on", async () => {
+    const on = JSON.parse((await run(() => undefined, ["m/x", "--json", "--prefer-precision"])).stdout);
+    const off = JSON.parse((await run(() => undefined, ["m/x", "--json"])).stdout);
+    expect([on.models[0].preferPrecision, off.models[0].preferPrecision]).toEqual([true, false]);
   });
 
   test("-e removes the excluded endpoint from the price guard's baseline", async () => {

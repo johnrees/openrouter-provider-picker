@@ -134,7 +134,11 @@ probe line.
    shorter, and four times the price half the turn. A `$run` under $0.01 counts
    as $0.01, so a free endpoint doesn't make every other price infinitely
    worse; one with no price ranks after the priced ones. When this ties, higher
-   quantization wins: fp4 < fp8 < not reported < bf16.
+   quantization wins: fp4 < fp8 < not reported < bf16. `--prefer-precision`
+   goes further: each step up that order (fp4 < fp8 < bf16) counts as a price
+   up to 25% higher or a turn about 12% longer (speed about 89%), so a
+   higher-precision row wins within those limits. A row that doesn't report its
+   quantization gets no step over fp8.
 4. **Far higher prices drop out:** an endpoint costing more than 2× _and_
    more than $1 above the cheapest fully reliable one of equal or better
    quantization, per reference agentic session, drops to the bottom
